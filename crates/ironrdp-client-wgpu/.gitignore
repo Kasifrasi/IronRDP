@@ -1,0 +1,52 @@
+# =========================
+# Rust & Cargo
+# =========================
+target/
+**/*.rs.bk
+*.pdb
+
+# =========================
+# Project Outputs & Data
+# =========================
+*.xlsx
+**/examples/output/
+/tmp/
+
+# =========================
+# Office & Temporary Lock Files
+# =========================
+.~lock.*#
+~$*.xlsx
+~$*.xlsm
+
+# =========================
+# Environment & Secrets
+# =========================
+.env
+.devbox/
+.direnv/
+.devenv/
+.venv/
+
+# =========================
+# Editors, IDEs & AI Tools
+# =========================
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+
+# =========================
+# OS Generated Files
+# =========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+/specification

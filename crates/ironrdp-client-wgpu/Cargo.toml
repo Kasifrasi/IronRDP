@@ -1,0 +1,45 @@
+[package]
+name = "ironrdp-client-wgpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = { version = "0.30", features = ["rwh_06"] }
+wgpu = "29"
+pollster = "0.4"
+ironrdp = { version = "0.15", features = ["session", "connector", "graphics", "input", "pdu"] }
+ironrdp-blocking = "0.9"
+ironrdp-graphics = "0.8"
+ironrdp-input = "0.6"
+ironrdp-connector = "0.9"
+sspi = { version = "0.21", features = ["network_client"] }
+tokio-rustls = "0.26"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rwh_06 = { package = "raw-window-handle", version = "0.6" }
+
+# Optimize for fast dev iteration
+[profile.dev]
+opt-level = 0
+debug = 1             # line tables only – faster than full debug info
+split-debuginfo = "unpacked"  # faster linking
+incremental = true
+
+# Compile all dependencies at full speed – wgpu/ironrdp/rustls
+# are unusably slow at opt-level 0, while your own code stays fast.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Optimize build scripts and proc macros (speeds up the build itself)
+[profile.dev.build-override]
+opt-level = 3
+
+# Optimize for runtime speed in release builds
+[profile.release]
+opt-level = 3
+lto = "thin"          # use `lto = true` (fat) for maximum perf at longer compile time
+codegen-units = 1     # better optimization, slower compile
+strip = "debuginfo"   # smaller binary, keeps symbols for backtraces
+panic = "abort"       # no unwinding overhead – fine for a client binary

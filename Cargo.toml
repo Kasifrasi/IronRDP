@@ -12,6 +12,7 @@ exclude = [
   "crates/ironrdp-client-glutin",
   "crates/ironrdp-glutin-renderer",
   "crates/ironrdp-replay-client",
+  "crates/ironrdp-client-wgpu",
 ]
 
 [workspace.package]
