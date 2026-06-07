@@ -19,6 +19,19 @@
         };
         lib = pkgs.lib;
 
+        just-wrapper = pkgs.writeShellApplication {
+          name = "just";
+          runtimeInputs = [ pkgs.just pkgs.git ];
+          text = ''
+            # Finde das Root-Verzeichnis des IronRDP-Projekts
+            PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+            
+            # Leite just an den WGPU-Client weiter. 
+            # '$@' übergibt alle deine Argumente (wie 'dev' oder 'test') nahtlos.
+            exec just --justfile "$PROJECT_ROOT/crates/ironrdp-client-wgpu/Justfile" "$@"
+          '';
+        };
+
         # Rust toolchain: version pinned by ../../rust-toolchain.toml,
         # plus extra extensions for IDE support
         rustToolchain = (pkgs.rust-bin.fromRustupToolchainFile ../../rust-toolchain.toml).override {
@@ -73,7 +86,7 @@
           cargo-llvm-cov
           cargo-nextest
           sccache
-          just
+          just-wrapper
         ] ++ [ rustToolchain ];
 
       in {

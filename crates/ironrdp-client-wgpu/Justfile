@@ -1,0 +1,17 @@
+# IronRDP dev tasks
+
+# Run the wgpu client
+dev *ARGS:
+    cargo run {{ARGS}}
+
+# Run tests (pass extra args after --)
+test *ARGS:
+    cargo nextest run {{ARGS}}
+
+# Run clippy lints
+lint:
+    cargo clippy
+
+# Format code
+fmt:
+    cargo fmt
