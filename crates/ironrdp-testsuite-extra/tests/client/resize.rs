@@ -102,6 +102,10 @@ impl Drop for Session {
 
 impl Session {
     async fn connect() -> Self {
+        Self::connect_with_desktop_updates(false).await
+    }
+
+    async fn connect_with_desktop_updates(desktop_updates: bool) -> Self {
         let certs = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs");
         let identity =
             TlsIdentityCtx::init_from_paths(&certs.join("server-cert.pem"), &certs.join("server-key.pem")).unwrap();
@@ -139,6 +143,11 @@ impl Session {
             .unwrap();
         let (sender, mut output) = output_channel(64);
         let client = RdpClient::new(config, sender);
+        let client = if desktop_updates {
+            client.with_desktop_updates()
+        } else {
+            client
+        };
         let input = client.input_sender();
         let client = tokio::task::spawn_local(client.run());
         loop {
@@ -192,6 +201,25 @@ impl Session {
             .unwrap();
     }
 
+    fn send_graphics(&self, pdus: &[ironrdp_egfx::pdu::GfxPdu]) {
+        use ironrdp_dvc::pdu::{DataPdu, DrdynvcDataPdu, DrdynvcServerPdu};
+
+        let channel_id = self.graphics.lock().unwrap().channel_id().unwrap();
+        let mut payload = Vec::new();
+        for pdu in pdus {
+            payload.extend(ironrdp_core::encode_vec(pdu).unwrap());
+        }
+        let message = DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
+            channel_id,
+            ironrdp_graphics::zgfx::wrap_uncompressed(&payload),
+        )));
+        self.events
+            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                messages: vec![ironrdp_svc::SvcMessage::from(message)],
+            }))
+            .unwrap();
+    }
+
     async fn stays_connected(&mut self) {
         let observation = async {
             loop {
@@ -231,6 +259,108 @@ impl Session {
             .unwrap();
         self.input_barrier.recv().await.unwrap();
     }
+}
+
+// oracle: spec MS-RDPEGFX §2.2.2.14 (ResetGraphics applies monitor definitions before the following frame)
+#[tokio::test]
+async fn egfx_monitor_layout_precedes_its_desktop_update_at_the_same_extent() {
+    use ironrdp_egfx::pdu::{
+        Color, CreateSurfacePdu, EndFramePdu, GfxPdu, MapSurfaceToOutputPdu, PixelFormat, ResetGraphicsPdu,
+        SolidFillPdu, StartFramePdu, Timestamp,
+    };
+    use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
+    use ironrdp_pdu::geometry::ExclusiveRectangle;
+
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::task::LocalSet::new().run_until(async {
+            let mut session = Session::connect_with_desktop_updates(true).await;
+            for secondary_left in [400, -400] {
+                let monitors = vec![
+                    Monitor {
+                        left: 0,
+                        top: 0,
+                        right: 399,
+                        bottom: 599,
+                        flags: MonitorFlags::PRIMARY,
+                    },
+                    Monitor {
+                        left: secondary_left,
+                        top: 0,
+                        right: secondary_left + 399,
+                        bottom: 599,
+                        flags: MonitorFlags::empty(),
+                    },
+                ];
+                session.send_graphics(&[
+                    GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                        width: 800,
+                        height: 600,
+                        monitors: monitors.clone(),
+                    }),
+                    GfxPdu::CreateSurface(CreateSurfacePdu {
+                        surface_id: 1,
+                        width: 800,
+                        height: 600,
+                        pixel_format: PixelFormat::XRgb,
+                    }),
+                    GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+                        surface_id: 1,
+                        output_origin_x: 0,
+                        output_origin_y: 0,
+                    }),
+                    GfxPdu::StartFrame(StartFramePdu {
+                        timestamp: Timestamp {
+                            milliseconds: 0,
+                            seconds: 0,
+                            minutes: 0,
+                            hours: 0,
+                        },
+                        frame_id: 1,
+                    }),
+                    GfxPdu::SolidFill(SolidFillPdu {
+                        surface_id: 1,
+                        fill_pixel: Color {
+                            b: 0x30,
+                            g: 0x20,
+                            r: 0x10,
+                            xa: 0xFF,
+                        },
+                        rectangles: vec![ExclusiveRectangle {
+                            left: 0,
+                            top: 0,
+                            right: 800,
+                            bottom: 600,
+                        }],
+                    }),
+                    GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }),
+                ]);
+                let mut latest_layout = None;
+                loop {
+                    let event = session.output.recv().await.expect("client remains active");
+                    match event {
+                        RdpOutputEvent::MonitorLayout(actual) => latest_layout = Some(actual),
+                        RdpOutputEvent::DesktopUpdate(update) => {
+                            assert_eq!(latest_layout, Some(monitors));
+                            assert_eq!((update.width().get(), update.height().get()), (800, 600));
+                            assert_eq!(update.buffer().len(), 800 * 600);
+                            assert!(update.buffer().iter().all(|pixel| *pixel == 0x0010_2030));
+                            break;
+                        }
+                        event => assert!(
+                            !matches!(
+                                event,
+                                RdpOutputEvent::ConnectionFailure(_) | RdpOutputEvent::Terminated(_)
+                            ),
+                            "unexpected session failure: {event:?}"
+                        ),
+                    }
+                }
+            }
+        }),
+    )
+    .await
+    .expect("monitor layout test finishes");
 }
 
 // oracle: spec MS-RDPEDISP v10.0 §1.3 (EGFX resizes without reactivation)

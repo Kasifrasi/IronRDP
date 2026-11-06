@@ -15,4 +15,5 @@ pub mod clipboard;
 #[cfg(windows)]
 pub mod drives;
 mod keymap;
+pub mod monitor;
 pub mod rail;

@@ -69,6 +69,7 @@ use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_graphics::rectangle_processing::Region;
 use ironrdp_graphics::rfx::{self, MessageDecoder as RfxMessageDecoder, TileDecoder as RfxTileDecoder};
 use ironrdp_graphics::zgfx;
+use ironrdp_pdu::gcc::Monitor;
 use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle};
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
 use tracing::{debug, trace, warn};
@@ -493,6 +494,7 @@ pub struct GraphicsPipelineClient {
     current_frame_id: Option<u32>,
     total_frames_decoded: u32,
     pending_output_reset: Option<(u16, u16)>,
+    output_monitors: Vec<Monitor>,
 
     persistent_cache: Option<Box<dyn PersistentCacheStore>>,
     /// Whether the persistent cache was already listed for an offer on this channel. Offering
@@ -534,6 +536,7 @@ impl GraphicsPipelineClient {
             current_frame_id: None,
             total_frames_decoded: 0,
             pending_output_reset: None,
+            output_monitors: Vec::new(),
             persistent_cache: None,
             cache_import_attempted: false,
             offered_cache_keys: None,
@@ -713,6 +716,15 @@ impl GraphicsPipelineClient {
         self.pending_output_reset.take()
     }
 
+    /// The monitor layout from the most recent accepted `ResetGraphics`.
+    ///
+    /// Coordinates are relative to the primary monitor, with inclusive right and bottom edges.
+    /// An empty slice means the server did not supply a layout.
+    #[must_use]
+    pub fn output_monitors(&self) -> &[Monitor] {
+        &self.output_monitors
+    }
+
     // ========================================================================
     // PDU Handlers
     // ========================================================================
@@ -755,6 +767,7 @@ impl GraphicsPipelineClient {
             }
             GfxPdu::ResetGraphics(reset) => {
                 self.handle_reset_graphics(reset.width, reset.height)?;
+                self.output_monitors = reset.monitors;
                 Ok(vec![])
             }
             GfxPdu::CreateSurface(create) => {
