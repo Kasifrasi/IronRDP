@@ -65,15 +65,49 @@ impl MonitorWindows {
         self.frame.size()
     }
 
+    pub(crate) fn connected(&mut self) {
+        self.resizes.connected();
+    }
+
+    pub(crate) fn login_completed(&mut self) {
+        self.resizes.login_completed();
+    }
+
     pub(crate) fn resized(&mut self, id: WindowId, size: PhysicalSize<u32>) -> anyhow::Result<bool> {
         let Some(index) = self.windows.iter().position(|view| view.window.id() == id) else {
             return Ok(false);
         };
-        self.resizes.resized(index, (size.width, size.height))
+        let changed = self.resizes.resized(index, (size.width, size.height))?;
+        Ok(self.synchronize_initial_sizes() || changed)
     }
 
     pub(crate) fn pending_resize(&self) -> Option<&DisplayControlMonitorLayout> {
-        self.resizes.pending()
+        if self.awaiting_frame {
+            None
+        } else {
+            self.resizes.pending()
+        }
+    }
+
+    fn synchronize_initial_sizes(&mut self) -> bool {
+        if self.awaiting_frame || !self.resizes.needs_initial_sizes() {
+            return false;
+        }
+        let sizes = self
+            .windows
+            .iter()
+            .map(|view| {
+                let size = view.window.inner_size();
+                (size.width, size.height)
+            })
+            .collect::<Vec<_>>();
+        match self.resizes.synchronize_initial_sizes(&sizes) {
+            Ok(changed) => changed,
+            Err(error) => {
+                warn!(%error, "Keeping the current remote resolution instead of fitting the initial windows");
+                false
+            }
+        }
     }
 
     pub(crate) fn resize_submitted(&mut self) {
@@ -137,6 +171,7 @@ impl MonitorWindows {
         self.resizes.observe_frame(self.frame.size());
         self.awaiting_frame = false;
         self.sync_windows(event_loop, context)?;
+        self.synchronize_initial_sizes();
         for view in &self.windows {
             view.window.request_redraw();
         }

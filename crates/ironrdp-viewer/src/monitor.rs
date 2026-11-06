@@ -152,18 +152,32 @@ impl MonitorLayout {
     /// Resizes one monitor in a horizontal row and keeps its neighbors adjacent.
     pub fn resize_horizontal(&self, index: usize, size: (u32, u32)) -> anyhow::Result<Self> {
         anyhow::ensure!(index < self.monitors.len(), "monitor index is out of range");
+        let mut monitors = self.monitors.clone();
+        let (width, height) = MonitorLayoutEntry::adjust_display_size(size.0, size.1);
+        monitors[index].width = u16::try_from(width)?;
+        monitors[index].height = u16::try_from(height)?;
+        Self::arrange_horizontal(monitors)
+    }
+
+    fn resize_horizontal_all(&self, sizes: &[(u32, u32)]) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            self.monitors.iter().all(|monitor| monitor.y == 0),
-            "dynamic resizing requires a horizontal monitor row"
+            sizes.len() == self.monitors.len(),
+            "window count does not match monitor layout"
         );
         let mut monitors = self.monitors.clone();
-        for (current, monitor) in monitors.iter_mut().enumerate() {
-            if current == index {
-                let (width, height) = MonitorLayoutEntry::adjust_display_size(size.0, size.1);
-                monitor.width = u16::try_from(width)?;
-                monitor.height = u16::try_from(height)?;
-            }
+        for (monitor, size) in monitors.iter_mut().zip(sizes) {
+            let (width, height) = MonitorLayoutEntry::adjust_display_size(size.0, size.1);
+            monitor.width = u16::try_from(width)?;
+            monitor.height = u16::try_from(height)?;
         }
+        Self::arrange_horizontal(monitors)
+    }
+
+    fn arrange_horizontal(mut monitors: Vec<MonitorViewport>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            monitors.iter().all(|monitor| monitor.y == 0),
+            "dynamic resizing requires a horizontal monitor row"
+        );
         let mut order: Vec<_> = (0..monitors.len()).collect();
         order.sort_by_key(|&index| monitors[index].x);
         let mut width = 0u32;
@@ -227,10 +241,61 @@ pub struct MonitorResizeState {
     local_sizes: Vec<Option<(u32, u32)>>,
     pending: Option<DisplayControlMonitorLayout>,
     has_frame: bool,
+    logged_in: bool,
+    has_post_logon_frame: bool,
+    initial_sizes_synced: bool,
     scale_factor: u32,
 }
 
 impl MonitorResizeState {
+    /// Starts a connection without discarding monitor metadata received during activation.
+    pub fn connected(&mut self) {
+        self.logged_in = false;
+        self.has_post_logon_frame = false;
+        self.initial_sizes_synced = false;
+        self.has_frame = false;
+        self.desired = self.applied.clone();
+        self.submitted = None;
+        self.pending = None;
+    }
+
+    /// Records successful remote logon.
+    pub fn login_completed(&mut self) {
+        if !self.logged_in {
+            self.logged_in = true;
+            self.has_post_logon_frame = false;
+        }
+    }
+
+    /// Returns whether native window sizes can be fitted for this connection.
+    pub fn needs_initial_sizes(&self) -> bool {
+        !self.initial_sizes_synced && self.has_post_logon_frame
+    }
+
+    /// Requests the initial native window sizes after logon and a matching desktop frame.
+    pub fn synchronize_initial_sizes(&mut self, sizes: &[(u32, u32)]) -> anyhow::Result<bool> {
+        if !self.needs_initial_sizes() {
+            return Ok(false);
+        }
+        let Some(desired) = &self.desired else {
+            return Ok(false);
+        };
+        if sizes.len() != desired.monitors.len() || sizes.iter().any(|&(width, height)| width == 0 || height == 0) {
+            return Ok(false);
+        }
+        // Try once per connection, so a rejected or unsupported layout cannot cause a resize loop.
+        self.initial_sizes_synced = true;
+        let resized = desired.resize_horizontal_all(sizes)?;
+        let pending = resized.to_display_control(self.scale_factor)?;
+        self.local_sizes = sizes.iter().copied().map(Some).collect();
+        if &resized == desired {
+            return Ok(false);
+        }
+        self.desired = Some(resized);
+        self.pending = Some(pending);
+        Ok(true)
+    }
+
     #[must_use]
     pub fn new(scale_factor: u32) -> Self {
         Self {
@@ -240,6 +305,9 @@ impl MonitorResizeState {
             local_sizes: Vec::new(),
             pending: None,
             has_frame: false,
+            logged_in: false,
+            has_post_logon_frame: false,
+            initial_sizes_synced: false,
             scale_factor,
         }
     }
@@ -272,6 +340,7 @@ impl MonitorResizeState {
     pub fn observe_frame(&mut self, size: (u16, u16)) {
         if self.applied.as_ref().is_some_and(|layout| layout.size() == size) {
             self.has_frame = true;
+            self.has_post_logon_frame |= self.logged_in;
         } else {
             self.reset();
         }
@@ -341,13 +410,14 @@ impl MonitorResizeState {
         self.local_sizes.truncate(count);
     }
 
-    /// Clears connection state while retaining the geometry of surviving native windows.
+    /// Clears layout state while retaining logon state and surviving native window geometry.
     pub fn reset(&mut self) {
         self.applied = None;
         self.desired = None;
         self.submitted = None;
         self.pending = None;
         self.has_frame = false;
+        self.has_post_logon_frame = false;
     }
 }
 
