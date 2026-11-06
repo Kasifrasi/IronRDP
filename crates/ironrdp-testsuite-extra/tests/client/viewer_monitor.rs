@@ -6,46 +6,27 @@ use ironrdp::pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp_viewer::monitor::{DesktopFrame, MonitorLayout, MonitorResizeState, MonitorViewport};
 
-// oracle: reference native-window fit model; three 1888×1004 windows require a 5664×1004 desktop after logon.
+// oracle: reference horizontal native-window model; 1888 + 1400 + 1600 = 4888 pixels wide, 1004 pixels high.
 #[test]
-fn initial_native_sizes_are_applied_after_logon_and_a_matching_frame() {
-    let layout = MonitorLayout::new(&[
+fn native_windows_define_the_initial_monitor_topology() {
+    let initial = MonitorLayout::new(&[
         monitor(0, 0, 1279, 799, true),
         monitor(1280, 0, 2559, 799, false),
         monitor(2560, 0, 3839, 799, false),
     ])
     .unwrap();
-    let sizes = [(1888, 1004); 3];
-    let mut state = MonitorResizeState::new(100);
-    state.set_layout(&layout);
-    state.connected();
-    for (index, size) in sizes.iter().copied().enumerate() {
-        assert!(!state.resized(index, size).unwrap());
-    }
-    state.observe_frame(layout.size());
-    assert!(!state.synchronize_initial_sizes(&sizes).unwrap());
-    state.login_completed();
-    assert!(!state.synchronize_initial_sizes(&sizes).unwrap());
-    state.observe_frame(layout.size());
-    assert!(state.synchronize_initial_sizes(&sizes).unwrap());
-    let request = state.pending().expect("native sizes are requested automatically");
-    assert_eq!(request.desktop_size(), (5664, 1004));
+    let fitted = initial
+        .fit_window_sizes(&[(1888, 1004), (1400, 900), (1600, 1000)])
+        .unwrap();
+    assert_eq!(fitted.size(), (4888, 1004));
     assert_eq!(
-        request
-            .monitors()
-            .iter()
-            .map(|entry| (entry.position(), entry.dimensions()))
-            .collect::<Vec<_>>(),
+        fitted.to_client_monitor_data().unwrap().monitors,
         vec![
-            (Some((0, 0)), (1888, 1004)),
-            (Some((1888, 0)), (1888, 1004)),
-            (Some((3776, 0)), (1888, 1004)),
+            monitor(0, 0, 1887, 1003, true),
+            monitor(1888, 0, 3287, 899, false),
+            monitor(3288, 0, 4887, 999, false),
         ]
     );
-    state.submitted();
-    state.observe_frame(layout.size());
-    assert!(!state.synchronize_initial_sizes(&sizes).unwrap());
-    assert!(state.pending().is_none());
 }
 
 // oracle: reference horizontal tiling model; 8000 + 200 + 200 = 8400 pixels wide and 3000 pixels high.
@@ -57,16 +38,35 @@ fn initial_sizes_are_validated_as_one_complete_layout() {
         monitor(16384, 0, 24575, 999, false),
     ])
     .unwrap();
+    let fitted = layout
+        .fit_window_sizes(&[(8000, 3000), (200, 3000), (200, 3000)])
+        .unwrap();
+    assert_eq!(fitted.to_display_control(100).unwrap().desktop_size(), (8400, 3000));
+}
+
+// oracle: reference native-window model; every monitor requires a nonempty native content rectangle.
+#[rstest::rstest]
+#[case::missing_window(vec![(1888, 1004)])]
+#[case::empty_width(vec![(1888, 1004), (0, 900)])]
+#[case::empty_height(vec![(1888, 1004), (1400, 0)])]
+fn initial_layout_requires_all_nonempty_windows(#[case] sizes: Vec<(u32, u32)>) {
+    let layout = MonitorLayout::new(&[monitor(0, 0, 1279, 799, true), monitor(1280, 0, 2559, 799, false)]).unwrap();
+    assert!(layout.fit_window_sizes(&sizes).is_err());
+}
+
+// oracle: reference native-window resize continuity; a change after the startup snapshot remains requested when the first frame arrives.
+#[test]
+fn resize_during_connection_waits_for_the_first_matching_frame() {
+    let layout = MonitorLayout::new(&[monitor(0, 0, 1887, 1003, true), monitor(1888, 0, 3775, 1003, false)]).unwrap();
     let mut state = MonitorResizeState::new(100);
     state.set_layout(&layout);
-    state.login_completed();
+    state.resized(0, (1888, 1004)).unwrap();
+    state.resized(1, (1888, 1004)).unwrap();
+    assert!(!state.resized(1, (1400, 900)).unwrap());
+    assert!(state.pending().is_none());
     state.observe_frame(layout.size());
-    assert!(
-        state
-            .synchronize_initial_sizes(&[(8000, 3000), (200, 3000), (200, 3000)])
-            .unwrap()
-    );
-    assert_eq!(state.pending().unwrap().desktop_size(), (8400, 3000));
+    assert_eq!(state.pending().unwrap().desktop_size(), (3288, 1004));
+    assert_eq!(state.pending().unwrap().monitors()[1].dimensions(), (1400, 900));
 }
 
 // oracle: fallback must not infer monitor topology from framebuffer dimensions alone

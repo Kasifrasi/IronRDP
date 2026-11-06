@@ -30,9 +30,11 @@ To open three virtual monitors over one connection:
 ironrdp-viewer <HOSTNAME> --username <USERNAME> --monitor-count 3 --desktop-width 1280 --desktop-height 800
 ```
 
-Each monitor is 1280×800, arranged horizontally with the first monitor primary.
-The viewer opens a window for each monitor reported by the server.
-The initial compositor configuration keeps the requested remote resolution.
+The preferred initial window size is 1280×800 per monitor, arranged horizontally with the first monitor primary.
+Before connecting, the viewer creates the desktop windows and waits for their native sizes to settle.
+The initial RDP monitor layout uses those actual sizes, including sizes assigned by a tiling compositor.
+This also applies to ordinary single-window desktop connections.
+After connecting, the viewer follows the monitor layout confirmed by the server.
 Later window resizes request a new resolution for that monitor and move its horizontal neighbors to keep them adjacent.
 The viewer debounces changes and displays the server's applied layout; closing any monitor window closes the connection.
 If the server supplies no usable monitor layout, one window shows the combined desktop and its title identifies the fallback.

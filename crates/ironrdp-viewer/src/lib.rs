@@ -18,3 +18,4 @@ pub mod drives;
 mod keymap;
 pub mod monitor;
 pub mod rail;
+pub mod startup;
