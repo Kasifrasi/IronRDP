@@ -18,6 +18,7 @@ struct DesktopWindow {
     window: Arc<Window>,
     surface: Surface,
     viewport: Option<MonitorViewport>,
+    presented: bool,
 }
 
 /// Presents a shared desktop in windows using the server's monitor definitions.
@@ -33,6 +34,52 @@ pub(crate) struct MonitorWindows {
 }
 
 impl MonitorWindows {
+    pub(crate) fn prepare(&mut self, layout: MonitorLayout) {
+        self.resizes.set_layout(&layout);
+        self.layout = Some(layout);
+    }
+
+    pub(crate) fn native_sizes(&self) -> Option<Vec<(u32, u32)>> {
+        if self.windows.is_empty() || self.windows.iter().any(|view| !view.presented) {
+            return None;
+        }
+        self.windows
+            .iter()
+            .map(|view| {
+                let size = view.window.inner_size();
+                (size.width != 0 && size.height != 0).then_some((size.width, size.height))
+            })
+            .collect()
+    }
+
+    pub(crate) fn native_scale_factor(&self) -> u32 {
+        let scale = self
+            .windows
+            .iter()
+            .find(|view| view.viewport.is_some_and(|viewport| viewport.primary))
+            .map_or(1.0, |view| view.window.scale_factor());
+        #[expect(clippy::as_conversions, reason = "winit supplies a finite positive display scale")]
+        let scale = (scale * 100.0).round() as u32;
+        scale.clamp(100, 500)
+    }
+
+    pub(crate) fn set_scale_factor(&mut self, scale_factor: u32) -> anyhow::Result<()> {
+        self.resizes = MonitorResizeState::new(scale_factor);
+        if let Some(layout) = &self.layout {
+            self.resizes.set_layout(layout);
+        }
+        for (index, view) in self.windows.iter().enumerate() {
+            let size = view.window.inner_size();
+            self.resizes.resized(index, (size.width, size.height))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn into_single_window(mut self) -> (Arc<Window>, Surface) {
+        let view = self.windows.pop().expect("prepared desktop has one window");
+        (view.window, view.surface)
+    }
+
     pub(crate) fn new(initial_size: PhysicalSize<u32>, scale_factor: u32) -> Self {
         Self {
             windows: Vec::new(),
@@ -65,20 +112,11 @@ impl MonitorWindows {
         self.frame.size()
     }
 
-    pub(crate) fn connected(&mut self) {
-        self.resizes.connected();
-    }
-
-    pub(crate) fn login_completed(&mut self) {
-        self.resizes.login_completed();
-    }
-
     pub(crate) fn resized(&mut self, id: WindowId, size: PhysicalSize<u32>) -> anyhow::Result<bool> {
         let Some(index) = self.windows.iter().position(|view| view.window.id() == id) else {
             return Ok(false);
         };
-        let changed = self.resizes.resized(index, (size.width, size.height))?;
-        Ok(self.synchronize_initial_sizes() || changed)
+        self.resizes.resized(index, (size.width, size.height))
     }
 
     pub(crate) fn pending_resize(&self) -> Option<&DisplayControlMonitorLayout> {
@@ -86,27 +124,6 @@ impl MonitorWindows {
             None
         } else {
             self.resizes.pending()
-        }
-    }
-
-    fn synchronize_initial_sizes(&mut self) -> bool {
-        if self.awaiting_frame || !self.resizes.needs_initial_sizes() {
-            return false;
-        }
-        let sizes = self
-            .windows
-            .iter()
-            .map(|view| {
-                let size = view.window.inner_size();
-                (size.width, size.height)
-            })
-            .collect::<Vec<_>>();
-        match self.resizes.synchronize_initial_sizes(&sizes) {
-            Ok(changed) => changed,
-            Err(error) => {
-                warn!(%error, "Keeping the current remote resolution instead of fitting the initial windows");
-                false
-            }
         }
     }
 
@@ -171,7 +188,6 @@ impl MonitorWindows {
         self.resizes.observe_frame(self.frame.size());
         self.awaiting_frame = false;
         self.sync_windows(event_loop, context)?;
-        self.synchronize_initial_sizes();
         for view in &self.windows {
             view.window.request_redraw();
         }
@@ -236,6 +252,7 @@ impl MonitorWindows {
                     window,
                     surface,
                     viewport,
+                    presented: false,
                 });
             } else {
                 let view = &mut self.windows[index];
@@ -284,7 +301,9 @@ impl MonitorWindows {
         buffer
             .present()
             .map_err(|error| anyhow::anyhow!("unable to present monitor buffer: {error}"))
-            .context("monitor redraw")
+            .context("monitor redraw")?;
+        view.presented = true;
+        Ok(())
     }
 
     pub(crate) fn set_cursor(&mut self, cursor: Cursor) {

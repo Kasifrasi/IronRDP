@@ -9,6 +9,8 @@ use ironrdp_propertyset::PropertySet;
 use ironrdp_rpc::transport;
 use ironrdp_viewer::app::{App, RpcApp, ViewerEvent};
 use ironrdp_viewer::cli::ViewerConfig;
+use ironrdp_viewer::monitor::MonitorLayout;
+use ironrdp_viewer::startup::WindowedApp;
 use std::sync::Arc;
 use tokio::runtime;
 use tokio::sync::mpsc;
@@ -40,13 +42,11 @@ fn main() -> anyhow::Result<()> {
     let named_drives = cli.named_drives().to_vec();
     #[cfg(windows)]
     let ports = cli.ports().clone();
-    let config = cli.into_config().context("configuration")?;
-    #[cfg(not(windows))]
-    if !named_drives.is_empty() || !config.channels().rdpdr.drives.is_empty() {
-        tracing::warn!("Ignoring drive redirection request; it is only available on Windows");
-    }
+    let desktop_options = cli.desktop_options().cloned();
+    let builder = cli.into_config_builder().context("configuration")?;
 
     if let Some(dump_path) = dump_rdp {
+        let config = builder.build().context("configuration")?;
         // Dump the effective, secret-stripped PropertySet observed from the built configuration.
         let content = ironrdp_rdpfile::write(config.properties());
         std::fs::write(&dump_path, &content).with_context(|| format!("failed to write {}", dump_path.display()))?;
@@ -57,83 +57,105 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoop::<RdpOutputEvent>::with_user_event().build()?;
     let event_loop_proxy = event_loop.create_proxy();
     let (output_event_sender, mut output_event_receiver) = output_channel(64);
-    let remote_app = config.connector().remote_application_mode;
-    let desktop_scale_factor = config.connector().desktop_scale_factor;
-    let monitor_layout = config.connector().monitor_layout.as_ref();
-    let multiple_monitors = monitor_layout.is_some_and(|layout| 1 < layout.monitors.len());
-    let initial_window_size = if multiple_monitors {
-        let monitor = &monitor_layout.expect("multiple monitors require a layout").monitors[0];
-        PhysicalSize::new(
-            u32::try_from(monitor.right - monitor.left + 1)?,
-            u32::try_from(monitor.bottom - monitor.top + 1)?,
-        )
-    } else {
-        PhysicalSize::new(
+    // Native clipboard and device services stay on this thread until the event loop returns.
+    #[cfg(windows)]
+    let mut native_services = None;
+    #[cfg(windows)]
+    let services = &mut native_services;
+    let connect = move |desktop: Option<(&MonitorLayout, u32)>| -> anyhow::Result<_> {
+        let builder = if let Some((layout, scale_factor)) = desktop {
+            builder
+                .with_desktop_width(layout.size().0)
+                .with_desktop_height(layout.size().1)
+                .with_monitor_layout(layout.to_client_monitor_data()?)
+                .with_desktop_scale_factor(scale_factor)
+        } else {
+            builder
+        };
+        let config = builder.build().context("configuration")?;
+        #[cfg(not(windows))]
+        if !named_drives.is_empty() || !config.channels().rdpdr.drives.is_empty() {
+            tracing::warn!("Ignoring drive redirection request; it is only available on Windows");
+        }
+        let initial_window_size = PhysicalSize::new(
             u32::from(config.connector().desktop_size.width),
             u32::from(config.connector().desktop_size.height),
-        )
-    };
+        );
+        let multiple_monitors = config
+            .connector()
+            .monitor_layout
+            .as_ref()
+            .is_some_and(|layout| 1 < layout.monitors.len());
+        #[cfg(windows)]
+        let enable_smartcard = config.channels().rdpdr.smartcard;
+        #[cfg(windows)]
+        let enable_clipboard = config.channels().clipboard == ironrdp::client::config::ClipboardType::Enable;
+        #[cfg(windows)]
+        let server = config.destination().to_string();
+        #[cfg(windows)]
+        let drives = ironrdp_viewer::drives::ViewerDrives::from_rdpdr_config(&config.channels().rdpdr, named_drives);
+        let client = RdpClient::new(config, output_event_sender);
+        let client = if multiple_monitors {
+            client.with_desktop_updates()
+        } else {
+            client
+        };
+        #[cfg(windows)]
+        let (client, _drive_watcher) =
+            attach_windows_rdpdr_backend(client, enable_smartcard, printers.as_ref(), &ports, &drives, &server)?;
+        #[cfg(windows)]
+        let (client, _clipboard) = attach_windows_clipboard(client, enable_clipboard)?;
+        #[cfg(windows)]
+        {
+            *services = Some((_drive_watcher, _clipboard));
+        }
+        let input_event_sender = client.input_sender();
+        let rt = runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("unable to create tokio runtime")?;
 
-    #[cfg(windows)]
-    let enable_smartcard = config.channels().rdpdr.smartcard;
-    #[cfg(windows)]
-    let enable_clipboard = config.channels().clipboard == ironrdp::client::config::ClipboardType::Enable;
-    #[cfg(windows)]
-    let server = config.destination().to_string();
-    #[cfg(windows)]
-    let drives = ironrdp_viewer::drives::ViewerDrives::from_rdpdr_config(&config.channels().rdpdr, named_drives);
-    let client = RdpClient::new(config, output_event_sender);
-    let client = if multiple_monitors {
-        client.with_desktop_updates()
-    } else {
-        client
-    };
-    #[cfg(windows)]
-    let (client, _drive_watcher) =
-        attach_windows_rdpdr_backend(client, enable_smartcard, printers.as_ref(), &ports, &drives, &server)?;
-    // Kept alive, on this thread, until the event loop returns.
-    #[cfg(windows)]
-    let (client, _clipboard) = attach_windows_clipboard(client, enable_clipboard)?;
-    let input_event_sender = client.input_sender();
-
-    let mut app = App::new(&event_loop, &input_event_sender, initial_window_size, remote_app)
-        .context("unable to initialize App")?;
-    if multiple_monitors {
-        app = app.with_monitor_windows(desktop_scale_factor);
-    }
-
-    let rt = runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("unable to create tokio runtime")?;
-
-    // Forward output events from the library's output channel to winit's `EventLoopProxy`.
-    //
-    // The library is winit-agnostic: it just emits `RdpOutputEvent`s on
-    // `output_channel`'s `OutputEventSender`/`OutputEventReceiver` pair (a plain
-    // `mpsc` channel for correctness-sensitive events, `watch` channels underneath
-    // for high-frequency display state; see `RdpOutputEvent::drop_policy`).
-    // Bridging onto the GUI event loop is the binary's job.
-    let output_forwarder = rt.spawn(async move {
-        while let Some(event) = output_event_receiver.recv().await {
-            if event_loop_proxy.send_event(event).is_err() {
-                // The event loop is gone; nothing left to forward.
-                break;
+        // Forward output events from the library's output channel to winit's `EventLoopProxy`.
+        //
+        // The library is winit-agnostic: it just emits `RdpOutputEvent`s on
+        // `output_channel`'s `OutputEventSender`/`OutputEventReceiver` pair (a plain
+        // `mpsc` channel for correctness-sensitive events, `watch` channels underneath
+        // for high-frequency display state; see `RdpOutputEvent::drop_policy`).
+        // Bridging onto the GUI event loop is the binary's job.
+        let output_forwarder = rt.spawn(async move {
+            while let Some(event) = output_event_receiver.recv().await {
+                if event_loop_proxy.send_event(event).is_err() {
+                    // The event loop is gone; nothing left to forward.
+                    break;
+                }
             }
-        }
-    });
+        });
 
-    debug!("Start RDP thread");
-    std::thread::spawn(move || {
-        rt.block_on(client.run());
-        // Deliver the final failure or termination event before dropping the runtime.
-        if let Err(error) = rt.block_on(output_forwarder) {
-            tracing::warn!(%error, "RDP output forwarder failed");
+        debug!("Start RDP thread");
+        std::thread::spawn(move || {
+            rt.block_on(client.run());
+            // Deliver the final failure or termination event before dropping the runtime.
+            if let Err(error) = rt.block_on(output_forwarder) {
+                tracing::warn!(%error, "RDP output forwarder failed");
+            }
+        });
+        Ok((input_event_sender, initial_window_size))
+    };
+    if let Some(options) = desktop_options {
+        let mut app = WindowedApp::new(
+            &event_loop,
+            options,
+            Box::new(move |layout, scale_factor| connect(Some((layout, scale_factor))).map(|(sender, _)| sender)),
+        )?;
+        event_loop.run_app(&mut app)?;
+        if let Some(error) = app.take_error() {
+            return Err(error);
         }
-    });
-
-    debug!("Run App");
-    event_loop.run_app(&mut app)?;
+    } else {
+        let (sender, size) = connect(None)?;
+        let mut app = App::new(&event_loop, &sender, size, true).context("unable to initialize App")?;
+        event_loop.run_app(&mut app)?;
+    }
 
     Ok(())
 }
@@ -206,10 +228,8 @@ fn run_rpc(cli: ViewerConfig) -> anyhow::Result<()> {
 /// Creates the Windows clipboard backend on this thread, the winit one, when clipboard redirection
 /// is enabled.
 ///
-/// The clipboard listens through a hidden window, so it needs a thread with a message loop,
-/// which the RDP thread is not; pasting remote files also needs OLE on a single-threaded
-/// apartment, initialized here before winit creates its window (winit's own `OleInitialize`
-/// then succeeds as a no-op).
+/// The clipboard listens through a hidden window, so it needs the UI thread's message loop.
+/// Pasting remote files also needs OLE in a single-threaded apartment, which winit uses as well.
 #[cfg(windows)]
 fn attach_windows_clipboard(
     client: RdpClient,
@@ -219,7 +239,7 @@ fn attach_windows_clipboard(
         return Ok((client, None));
     }
 
-    // SAFETY: Called on the main thread before any COM use; it lasts for the process.
+    // SAFETY: Called on the main thread; the apartment lasts for the process.
     unsafe { windows::Win32::System::Ole::OleInitialize(None) }.context("unable to initialize OLE")?;
 
     let clipboard = ironrdp_cliprdr_native::WinClipboard::with_file_transfer(

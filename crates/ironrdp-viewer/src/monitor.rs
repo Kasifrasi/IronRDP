@@ -3,7 +3,7 @@
 use ironrdp::client::rdp::DesktopUpdate;
 use ironrdp::displaycontrol::pdu::{DeviceScaleFactor, DisplayControlMonitorLayout, MonitorLayoutEntry};
 use ironrdp::input::MousePosition;
-use ironrdp::pdu::gcc::{MONITOR_COUNT_MAX, Monitor, MonitorFlags};
+use ironrdp::pdu::gcc::{ClientMonitorData, MONITOR_COUNT_MAX, Monitor, MonitorFlags};
 
 /// Maximum memory retained for a shared desktop, matching the graphics compositor's limit.
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
@@ -159,10 +159,45 @@ impl MonitorLayout {
         Self::arrange_horizontal(monitors)
     }
 
-    fn resize_horizontal_all(&self, sizes: &[(u32, u32)]) -> anyhow::Result<Self> {
+    /// Builds the initial monitor topology in primary-relative coordinates.
+    pub fn to_client_monitor_data(&self) -> anyhow::Result<ClientMonitorData> {
+        let primary = self
+            .monitors
+            .iter()
+            .find(|monitor| monitor.primary)
+            .ok_or_else(|| anyhow::anyhow!("monitor layout has no primary monitor"))?;
+        Ok(ClientMonitorData {
+            monitors: self
+                .monitors
+                .iter()
+                .map(|monitor| {
+                    let left = i32::from(monitor.x) - i32::from(primary.x);
+                    let top = i32::from(monitor.y) - i32::from(primary.y);
+                    Monitor {
+                        left,
+                        top,
+                        right: left + i32::from(monitor.width) - 1,
+                        bottom: top + i32::from(monitor.height) - 1,
+                        flags: if monitor.primary {
+                            MonitorFlags::PRIMARY
+                        } else {
+                            MonitorFlags::empty()
+                        },
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    /// Fits a horizontal monitor row to the native window contents before connecting.
+    pub fn fit_window_sizes(&self, sizes: &[(u32, u32)]) -> anyhow::Result<Self> {
         anyhow::ensure!(
             sizes.len() == self.monitors.len(),
             "window count does not match monitor layout"
+        );
+        anyhow::ensure!(
+            sizes.iter().all(|&(width, height)| width != 0 && height != 0),
+            "window contents are empty"
         );
         let mut monitors = self.monitors.clone();
         for (monitor, size) in monitors.iter_mut().zip(sizes) {
@@ -241,61 +276,10 @@ pub struct MonitorResizeState {
     local_sizes: Vec<Option<(u32, u32)>>,
     pending: Option<DisplayControlMonitorLayout>,
     has_frame: bool,
-    logged_in: bool,
-    has_post_logon_frame: bool,
-    initial_sizes_synced: bool,
     scale_factor: u32,
 }
 
 impl MonitorResizeState {
-    /// Starts a connection without discarding monitor metadata received during activation.
-    pub fn connected(&mut self) {
-        self.logged_in = false;
-        self.has_post_logon_frame = false;
-        self.initial_sizes_synced = false;
-        self.has_frame = false;
-        self.desired = self.applied.clone();
-        self.submitted = None;
-        self.pending = None;
-    }
-
-    /// Records successful remote logon.
-    pub fn login_completed(&mut self) {
-        if !self.logged_in {
-            self.logged_in = true;
-            self.has_post_logon_frame = false;
-        }
-    }
-
-    /// Returns whether native window sizes can be fitted for this connection.
-    pub fn needs_initial_sizes(&self) -> bool {
-        !self.initial_sizes_synced && self.has_post_logon_frame
-    }
-
-    /// Requests the initial native window sizes after logon and a matching desktop frame.
-    pub fn synchronize_initial_sizes(&mut self, sizes: &[(u32, u32)]) -> anyhow::Result<bool> {
-        if !self.needs_initial_sizes() {
-            return Ok(false);
-        }
-        let Some(desired) = &self.desired else {
-            return Ok(false);
-        };
-        if sizes.len() != desired.monitors.len() || sizes.iter().any(|&(width, height)| width == 0 || height == 0) {
-            return Ok(false);
-        }
-        // Try once per connection, so a rejected or unsupported layout cannot cause a resize loop.
-        self.initial_sizes_synced = true;
-        let resized = desired.resize_horizontal_all(sizes)?;
-        let pending = resized.to_display_control(self.scale_factor)?;
-        self.local_sizes = sizes.iter().copied().map(Some).collect();
-        if &resized == desired {
-            return Ok(false);
-        }
-        self.desired = Some(resized);
-        self.pending = Some(pending);
-        Ok(true)
-    }
-
     #[must_use]
     pub fn new(scale_factor: u32) -> Self {
         Self {
@@ -305,9 +289,6 @@ impl MonitorResizeState {
             local_sizes: Vec::new(),
             pending: None,
             has_frame: false,
-            logged_in: false,
-            has_post_logon_frame: false,
-            initial_sizes_synced: false,
             scale_factor,
         }
     }
@@ -340,7 +321,6 @@ impl MonitorResizeState {
     pub fn observe_frame(&mut self, size: (u16, u16)) {
         if self.applied.as_ref().is_some_and(|layout| layout.size() == size) {
             self.has_frame = true;
-            self.has_post_logon_frame |= self.logged_in;
         } else {
             self.reset();
         }
@@ -354,7 +334,7 @@ impl MonitorResizeState {
         }
         self.local_sizes.resize(self.local_sizes.len().max(index + 1), None);
         let previous = self.local_sizes[index].replace(size);
-        if previous.is_none() || previous == Some(size) || !self.has_frame {
+        if previous.is_none() || previous == Some(size) {
             return Ok(false);
         }
         let Some(desired) = self.desired.as_ref() else {
@@ -367,11 +347,11 @@ impl MonitorResizeState {
         let pending = resized.to_display_control(self.scale_factor)?;
         self.desired = Some(resized);
         self.pending = Some(pending);
-        Ok(true)
+        Ok(self.has_frame)
     }
 
     pub fn pending(&self) -> Option<&DisplayControlMonitorLayout> {
-        self.pending.as_ref()
+        self.pending.as_ref().filter(|_| self.has_frame)
     }
 
     /// Marks the current request as delivered to the client input queue.
@@ -410,14 +390,13 @@ impl MonitorResizeState {
         self.local_sizes.truncate(count);
     }
 
-    /// Clears layout state while retaining logon state and surviving native window geometry.
+    /// Clears layout state while retaining surviving native window geometry.
     pub fn reset(&mut self) {
         self.applied = None;
         self.desired = None;
         self.submitted = None;
         self.pending = None;
         self.has_frame = false;
-        self.has_post_logon_frame = false;
     }
 }
 

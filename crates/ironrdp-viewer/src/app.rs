@@ -36,6 +36,11 @@ const MAX_PENDING_RAIL_INPUTS: usize = 64;
 
 type WindowSurface = (Arc<Window>, softbuffer::Surface<OwnedDisplayHandle, Arc<Window>>);
 
+pub(crate) fn create_context(display: OwnedDisplayHandle) -> anyhow::Result<softbuffer::Context<OwnedDisplayHandle>> {
+    softbuffer::Context::new(display)
+        .map_err(|error| anyhow::anyhow!("unable to initialize softbuffer context: {error}"))
+}
+
 /// Events delivered from the viewer-hosted RPC server to the window.
 pub enum ViewerEvent {
     FrameAvailable,
@@ -65,6 +70,7 @@ pub struct RpcApp {
     buffer_size: (u16, u16),
     input_database: ironrdp::input::Database,
     last_size: Option<PhysicalSize<u32>>,
+    last_window_size: Option<PhysicalSize<u32>>,
     resize_timeout: Option<Instant>,
     /// What the server's RDPEI channel accepts; touch is emulated as mouse input otherwise.
     rdpei_input_state: RdpeiInputState,
@@ -102,20 +108,37 @@ impl App {
         remote_app: bool,
     ) -> anyhow::Result<Self> {
         let inner = RpcApp::new_inner(
-            event_loop,
+            create_context(event_loop.owned_display_handle())?,
             InputTarget::Direct(input_event_sender.clone()),
             None,
             initial_window_size,
             remote_app,
-        )?;
+        );
         Ok(Self { inner })
     }
 
-    /// Shows each server monitor in its own window and requests remote resolution changes on later resizes.
-    #[must_use]
-    pub fn with_monitor_windows(mut self, scale_factor: u32) -> Self {
-        self.inner.monitor_windows = Some(MonitorWindows::new(self.inner.initial_window_size, scale_factor));
-        self
+    pub(crate) fn from_prepared_desktop(
+        context: softbuffer::Context<OwnedDisplayHandle>,
+        windows: MonitorWindows,
+        input_event_sender: RdpInputSender,
+        initial_size: PhysicalSize<u32>,
+        multiple_monitors: bool,
+    ) -> Self {
+        let mut inner = RpcApp::new_inner(
+            context,
+            InputTarget::Direct(input_event_sender),
+            None,
+            initial_size,
+            false,
+        );
+        if multiple_monitors {
+            inner.monitor_windows = Some(windows);
+        } else {
+            let surface = windows.into_single_window();
+            inner.last_window_size = Some(surface.0.inner_size());
+            inner.window = Some(surface);
+        }
+        Self { inner }
     }
 }
 
@@ -127,27 +150,24 @@ impl RpcApp {
         initial_window_size: PhysicalSize<u32>,
     ) -> anyhow::Result<Self> {
         // RemoteApp windows need the client's RAIL output, which the RPC daemon does not expose.
-        Self::new_inner(
-            event_loop,
+        Ok(Self::new_inner(
+            create_context(event_loop.owned_display_handle())?,
             InputTarget::Rpc(daemon),
             Some(frame_wakeup),
             initial_window_size,
             false,
-        )
+        ))
     }
 
-    fn new_inner<T: 'static>(
-        event_loop: &EventLoop<T>,
+    fn new_inner(
+        context: softbuffer::Context<OwnedDisplayHandle>,
         input_target: InputTarget,
         frame_wakeup: Option<Arc<AtomicBool>>,
         initial_window_size: PhysicalSize<u32>,
         remote_app: bool,
-    ) -> anyhow::Result<Self> {
-        let context = softbuffer::Context::new(event_loop.owned_display_handle())
-            .map_err(|e| anyhow::anyhow!("unable to initialize softbuffer context: {e}"))?;
-
+    ) -> Self {
         let input_database = ironrdp::input::Database::new();
-        Ok(Self {
+        Self {
             input_target,
             frame_wakeup,
             context,
@@ -158,6 +178,7 @@ impl RpcApp {
             buffer_size: (0, 0),
             input_database,
             last_size: None,
+            last_window_size: None,
             resize_timeout: None,
             rdpei_input_state: RdpeiInputState::default(),
             touch_frames: TouchFrameBuilder::new(RDPEI_MAX_TOUCH_CONTACTS),
@@ -169,7 +190,7 @@ impl RpcApp {
             rail_windows: RailWindows::default(),
             pending_rail_inputs: std::collections::VecDeque::new(),
             release_pending: false,
-        })
+        }
     }
 
     /// Whether `error` is a transport EOF, abort, reset, or broken pipe expected after a local close request.
@@ -511,8 +532,10 @@ impl RpcApp {
 
         match event {
             WindowEvent::Resized(size) => {
-                self.last_size = Some(size);
-                self.resize_timeout = Some(Instant::now() + Duration::from_secs(1));
+                if self.last_window_size.replace(size) != Some(size) {
+                    self.last_size = Some(size);
+                    self.resize_timeout = Some(Instant::now() + Duration::from_secs(1));
+                }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 // The window moved to a monitor with another DPI, or the monitor DPI changed.
@@ -795,9 +818,6 @@ impl RpcApp {
         match event {
             RdpOutputEvent::Connected => {
                 self.close_requested = false;
-                if let Some(monitors) = &mut self.monitor_windows {
-                    monitors.connected();
-                }
                 info!("RDP session connected");
             }
             RdpOutputEvent::MonitorLayout(monitors) => {
@@ -832,9 +852,6 @@ impl RpcApp {
             }
             RdpOutputEvent::LoginComplete => {
                 info!("RDP login complete");
-                if let Some(monitors) = &mut self.monitor_windows {
-                    monitors.login_completed();
-                }
             }
             // The viewer sends absolute pointer events only, so no input depends on these flags.
             RdpOutputEvent::ServerInputFlags(_) => {}
