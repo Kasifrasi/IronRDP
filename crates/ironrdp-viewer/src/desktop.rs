@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use ironrdp::client::rdp::DesktopUpdate;
+use ironrdp::displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp::pdu::gcc::Monitor;
 use tracing::{info, warn};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event_loop::{ActiveEventLoop, OwnedDisplayHandle};
 use winit::window::{Cursor, Window, WindowAttributes, WindowId};
 
-use crate::monitor::{DesktopFrame, MonitorLayout, MonitorViewport};
+use crate::monitor::{DesktopFrame, MonitorLayout, MonitorResizeState, MonitorViewport};
 use crate::rail::bounded_window_size;
 
 type Surface = softbuffer::Surface<OwnedDisplayHandle, Arc<Window>>;
@@ -28,10 +29,11 @@ pub(crate) struct MonitorWindows {
     initial_size: PhysicalSize<u32>,
     cursor: Cursor,
     cursor_visible: bool,
+    resizes: MonitorResizeState,
 }
 
 impl MonitorWindows {
-    pub(crate) fn new(initial_size: PhysicalSize<u32>) -> Self {
+    pub(crate) fn new(initial_size: PhysicalSize<u32>, scale_factor: u32) -> Self {
         Self {
             windows: Vec::new(),
             layout: None,
@@ -40,6 +42,7 @@ impl MonitorWindows {
             initial_size,
             cursor: Cursor::from(winit::window::CursorIcon::default()),
             cursor_visible: true,
+            resizes: MonitorResizeState::new(scale_factor),
         }
     }
 
@@ -62,9 +65,29 @@ impl MonitorWindows {
         self.frame.size()
     }
 
+    pub(crate) fn resized(&mut self, id: WindowId, size: PhysicalSize<u32>) -> anyhow::Result<bool> {
+        let Some(index) = self.windows.iter().position(|view| view.window.id() == id) else {
+            return Ok(false);
+        };
+        self.resizes.resized(index, (size.width, size.height))
+    }
+
+    pub(crate) fn pending_resize(&self) -> Option<&DisplayControlMonitorLayout> {
+        self.resizes.pending()
+    }
+
+    pub(crate) fn resize_submitted(&mut self) {
+        self.resizes.submitted();
+    }
+
+    pub(crate) fn resize_rejected(&mut self) -> anyhow::Result<bool> {
+        self.resizes.rejected()
+    }
+
     pub(crate) fn reset(&mut self) {
         self.layout = None;
         self.frame.clear();
+        self.resizes.reset();
         self.awaiting_frame = true;
         for view in &mut self.windows {
             view.viewport = None;
@@ -96,6 +119,11 @@ impl MonitorWindows {
                 }
             }
         };
+        if let Some(layout) = &self.layout {
+            self.resizes.set_layout(layout);
+        } else {
+            self.resizes.reset();
+        }
         self.sync_windows(event_loop, context)
     }
 
@@ -106,6 +134,7 @@ impl MonitorWindows {
         update: &DesktopUpdate,
     ) -> anyhow::Result<()> {
         self.frame.apply(update)?;
+        self.resizes.observe_frame(self.frame.size());
         self.awaiting_frame = false;
         self.sync_windows(event_loop, context)?;
         for view in &self.windows {
@@ -134,6 +163,7 @@ impl MonitorWindows {
             _ => vec![None],
         };
         self.windows.truncate(viewports.len());
+        self.resizes.retain_windows(viewports.len());
         for (index, viewport) in viewports.into_iter().enumerate() {
             let title = match viewport {
                 Some(viewport)

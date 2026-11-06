@@ -225,7 +225,7 @@ struct Args {
 
     /// Open one window per virtual monitor in a horizontal row, with the first monitor primary.
     /// --desktop-width and --desktop-height specify each monitor's resolution.
-    /// Window resizing scales its view; closing any window closes the connection.
+    /// Later window resizes update that remote monitor; closing any window closes the connection.
     #[clap(long, value_parser = clap::value_parser!(u16).range(2..=16),
         requires_all = ["desktop_width", "desktop_height"], conflicts_with_all = ["rpc", "remote_app"])]
     monitor_count: Option<u16>,

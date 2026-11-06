@@ -111,10 +111,10 @@ impl App {
         Ok(Self { inner })
     }
 
-    /// Shows each server monitor in its own window, with local resizing scaling that monitor's view.
+    /// Shows each server monitor in its own window and requests remote resolution changes on later resizes.
     #[must_use]
-    pub fn with_monitor_windows(mut self) -> Self {
-        self.inner.monitor_windows = Some(MonitorWindows::new(self.inner.initial_window_size));
+    pub fn with_monitor_windows(mut self, scale_factor: u32) -> Self {
+        self.inner.monitor_windows = Some(MonitorWindows::new(self.inner.initial_window_size, scale_factor));
         self
     }
 }
@@ -330,6 +330,25 @@ impl RpcApp {
     }
 
     fn send_resize_event(&mut self) {
+        if let Some(monitors) = &mut self.monitor_windows {
+            let Some(layout) = monitors.pending_resize().cloned() else {
+                return;
+            };
+            let InputTarget::Direct(sender) = &self.input_target else {
+                return;
+            };
+            match sender.try_send(RdpInputEvent::MonitorLayout(layout)) {
+                Ok(()) => monitors.resize_submitted(),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    self.resize_timeout = Some(Instant::now() + Duration::from_millis(10));
+                }
+                Err(_) => {
+                    monitors.resize_submitted();
+                    warn!("Unable to enqueue monitor layout because the RDP session is closed");
+                }
+            }
+            return;
+        }
         let Some(size) = self.last_size else {
             return;
         };
@@ -701,7 +720,23 @@ impl RpcApp {
                     event_loop.exit();
                 }
             }
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::Resized(size) => {
+                if let Some(monitors) = &mut self.monitor_windows {
+                    match monitors.resized(window_id, size) {
+                        Ok(true) => self.resize_timeout = Some(Instant::now() + Duration::from_secs(1)),
+                        Ok(false) => {}
+                        Err(error) => warn!(%error, "Keeping the current remote monitor layout"),
+                    }
+                }
+                if let Some(window) = self
+                    .monitor_windows
+                    .as_ref()
+                    .and_then(|monitors| monitors.window(window_id))
+                {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(window) = self
                     .monitor_windows
                     .as_ref()
@@ -777,6 +812,16 @@ impl RpcApp {
             }
             RdpOutputEvent::MonitorLayoutRejected => {
                 warn!("The server cannot accept the requested monitor layout");
+                if let Some(monitors) = &mut self.monitor_windows {
+                    match monitors.resize_rejected() {
+                        Ok(true) => {
+                            self.resize_timeout
+                                .get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
+                        }
+                        Ok(false) => {}
+                        Err(error) => warn!(%error, "Unable to retain pending monitor changes after rejection"),
+                    }
+                }
             }
             RdpOutputEvent::LoginComplete => info!("RDP login complete"),
             // The viewer sends absolute pointer events only, so no input depends on these flags.

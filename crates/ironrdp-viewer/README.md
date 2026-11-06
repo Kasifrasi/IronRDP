@@ -32,7 +32,9 @@ ironrdp-viewer <HOSTNAME> --username <USERNAME> --monitor-count 3 --desktop-widt
 
 Each monitor is 1280×800, arranged horizontally with the first monitor primary.
 The viewer opens a window for each monitor reported by the server.
-Resizing a local window scales that monitor's view; closing any monitor window closes the connection.
+The initial compositor configuration keeps the requested remote resolution.
+Later window resizes request a new resolution for that monitor and move its horizontal neighbors to keep them adjacent.
+The viewer debounces changes and displays the server's applied layout; closing any monitor window closes the connection.
 If the server supplies no usable monitor layout, one window shows the combined desktop and its title identifies the fallback.
 This mode supports 2–16 virtual monitors and requires explicit per-monitor dimensions.
 It is available in direct desktop mode; RemoteApp and RPC mode use their existing window behavior.
