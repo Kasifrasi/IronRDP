@@ -311,12 +311,25 @@ impl MonitorWindows {
         context: &softbuffer::Context<OwnedDisplayHandle>,
         update: &DesktopUpdate,
     ) -> anyhow::Result<()> {
+        let sync_windows = self.awaiting_frame || self.frame.size() != (update.width().get(), update.height().get());
         self.frame.apply(update)?;
         self.resizes.observe_frame(self.frame.size());
         self.awaiting_frame = false;
-        self.sync_windows(event_loop, context)?;
-        for view in &self.windows {
-            view.window.request_redraw();
+        // UNTESTED: pixel-only updates must retain window bindings and wake only affected outputs.
+        // Check activity on one output, then a layout reset, when changing this gate.
+        if sync_windows {
+            self.sync_windows(event_loop, context)?;
+        } else {
+            let region = update.region();
+            for view in &self.windows {
+                let size = view.window.inner_size();
+                if view
+                    .viewport
+                    .is_some_and(|viewport| viewport.damage_region(&region, (size.width, size.height)).is_some())
+                {
+                    view.window.request_redraw();
+                }
+            }
         }
         Ok(())
     }
@@ -392,6 +405,7 @@ impl MonitorWindows {
                     attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(Some(output.monitor.clone()))));
                 }
                 let window = Arc::new(event_loop.create_window(attributes)?);
+                window.request_redraw();
                 window.set_cursor(self.cursor.clone());
                 window.set_cursor_visible(self.cursor_visible);
                 let surface = softbuffer::Surface::new(context, Arc::clone(&window))

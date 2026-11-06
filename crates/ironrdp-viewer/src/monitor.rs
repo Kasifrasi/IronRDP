@@ -7,6 +7,7 @@ use ironrdp::client::rdp::DesktopUpdate;
 use ironrdp::displaycontrol::pdu::{DeviceScaleFactor, DisplayControlMonitorLayout, MonitorLayoutEntry};
 use ironrdp::input::MousePosition;
 use ironrdp::pdu::gcc::{ClientMonitorData, MONITOR_COUNT_MAX, Monitor, MonitorFlags};
+use ironrdp::pdu::geometry::{ExclusiveRectangle, InclusiveRectangle};
 
 /// Maximum memory retained for a shared desktop, matching the graphics compositor's limit.
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
@@ -48,6 +49,32 @@ pub struct MonitorViewport {
 }
 
 impl MonitorViewport {
+    /// Maps changed framebuffer pixels to the exclusive target area that samples them.
+    pub fn damage_region(&self, region: &InclusiveRectangle, target_size: (u32, u32)) -> Option<ExclusiveRectangle> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let left = u32::from(region.left).max(u32::from(self.x));
+        let top = u32::from(region.top).max(u32::from(self.y));
+        let right = (u32::from(region.right) + 1).min(u32::from(self.x) + u32::from(self.width));
+        let bottom = (u32::from(region.bottom) + 1).min(u32::from(self.y) + u32::from(self.height));
+        if !(left < right && top < bottom) {
+            return None;
+        }
+        // A source interval [a,b) affects target pixels [ceil(a*T/S),ceil(b*T/S)).
+        let project = |position: u32, origin: u16, source: u16, target: u32| {
+            u16::try_from((u64::from(position - u32::from(origin)) * u64::from(target)).div_ceil(u64::from(source)))
+                .ok()
+        };
+        let damage = ExclusiveRectangle {
+            left: project(left, self.x, self.width, target_size.0)?,
+            top: project(top, self.y, self.height, target_size.1)?,
+            right: project(right, self.x, self.width, target_size.0)?,
+            bottom: project(bottom, self.y, self.height, target_size.1)?,
+        };
+        (damage.left < damage.right && damage.top < damage.bottom).then_some(damage)
+    }
+
     /// Maps a physical window position to the monitor's position in the shared framebuffer.
     /// Positions outside the window clamp to the nearest monitor pixel.
     pub fn position(&self, window_size: (u32, u32), local: (f64, f64)) -> Option<MousePosition> {

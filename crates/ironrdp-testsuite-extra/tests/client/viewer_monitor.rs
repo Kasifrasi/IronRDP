@@ -5,10 +5,115 @@ use std::time::Instant;
 use ironrdp::client::rdp::DesktopUpdate;
 use ironrdp::input::MousePosition;
 use ironrdp::pdu::gcc::{Monitor, MonitorFlags};
-use ironrdp::pdu::geometry::InclusiveRectangle;
+use ironrdp::pdu::geometry::{ExclusiveRectangle, InclusiveRectangle};
 use ironrdp_viewer::monitor::{
     DesktopFrame, MonitorFocusState, MonitorLayout, MonitorResizeState, MonitorViewport, OutputGeometry,
 };
+
+// oracle: reference nearest-neighbor scale-2 grid; source columns 1..=2 and row 0 occupy target [2,6) x [0,2).
+#[test]
+fn damage_region_selects_only_pixels_that_sample_the_changed_source() {
+    let viewport = MonitorViewport {
+        x: 4,
+        y: 2,
+        width: 4,
+        height: 2,
+        primary: false,
+    };
+    let changed = InclusiveRectangle {
+        left: 5,
+        top: 2,
+        right: 6,
+        bottom: 2,
+    };
+
+    assert_eq!(
+        viewport.damage_region(&changed, (8, 4)),
+        Some(ExclusiveRectangle {
+            left: 2,
+            top: 0,
+            right: 6,
+            bottom: 2
+        })
+    );
+}
+
+// oracle: reference nearest-neighbor grids; disjoint changes and source column 1 in a 4-to-2 reduction affect no target pixel.
+#[rstest::rstest]
+#[case::outside((8, 4), (0, 0, 3, 1))]
+#[case::not_sampled((2, 2), (5, 2, 5, 2))]
+fn damage_region_ignores_invisible_changes(#[case] target_size: (u32, u32), #[case] changed: (u16, u16, u16, u16)) {
+    let viewport = MonitorViewport {
+        x: 4,
+        y: 2,
+        width: 4,
+        height: 2,
+        primary: false,
+    };
+    let region = InclusiveRectangle {
+        left: changed.0,
+        top: changed.1,
+        right: changed.2,
+        bottom: changed.3,
+    };
+    assert_eq!(viewport.damage_region(&region, target_size), None);
+}
+
+// oracle: reference adjacent four-pixel monitors; inclusive source columns 3..=4 touch one column of each monitor.
+#[rstest::rstest]
+#[case::left(0, 3, 4)]
+#[case::right(4, 0, 1)]
+fn damage_region_splits_a_change_across_monitor_edges(#[case] x: u16, #[case] left: u16, #[case] right: u16) {
+    let viewport = MonitorViewport {
+        x,
+        y: 0,
+        width: 4,
+        height: 2,
+        primary: false,
+    };
+    let region = InclusiveRectangle {
+        left: 3,
+        top: 0,
+        right: 4,
+        bottom: 1,
+    };
+    assert_eq!(
+        viewport.damage_region(&region, (4, 2)),
+        Some(ExclusiveRectangle {
+            left,
+            top: 0,
+            right,
+            bottom: 2
+        })
+    );
+}
+
+// oracle: reference 3-to-5 nearest-neighbor row [0,0,1,1,2]; only target columns 2 and 3 sample source column 1.
+#[test]
+fn damage_region_rounds_fractional_scale_edges_up() {
+    let viewport = MonitorViewport {
+        x: 0,
+        y: 0,
+        width: 3,
+        height: 1,
+        primary: true,
+    };
+    let region = InclusiveRectangle {
+        left: 1,
+        top: 0,
+        right: 1,
+        bottom: 0,
+    };
+    assert_eq!(
+        viewport.damage_region(&region, (5, 1)),
+        Some(ExclusiveRectangle {
+            left: 2,
+            top: 0,
+            right: 4,
+            bottom: 1
+        })
+    );
+}
 
 // oracle: mutant releasing held input between focus loss and a later dispatch that focuses another monitor window.
 #[test]
