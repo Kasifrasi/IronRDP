@@ -65,6 +65,37 @@ fn parse_config_from_rdp(content: &str, extra_args: &[&str]) -> ironrdp_client::
     parse_config_from_rdp_result(content, extra_args).expect("failed to parse client config")
 }
 
+// oracle: reference CLI precedence model; explicit width overrides the profile, height and scale remain profile values.
+#[test]
+fn preferred_windows_follow_cli_and_profile_display_settings() {
+    let parsed = parse_viewer_config_from_rdp(
+        "full address:s:rdp.example.com\nusername:s:test\nClearTextPassword:s:test\ndesktopwidth:i:1440\ndesktopheight:i:900\ndesktopscalefactor:i:150\n",
+        &["--desktop-width", "1280"],
+    );
+    let desktop = parsed.desktop_options().unwrap();
+    assert_eq!(desktop.layout.size(), (1280, 900));
+    assert_eq!(desktop.scale_factor, Some(150));
+    let config = parsed.into_config().unwrap();
+    assert_eq!(
+        (
+            config.connector().desktop_size.width,
+            config.connector().desktop_size.height
+        ),
+        (1280, 900)
+    );
+}
+
+// oracle: reference RemoteApp ownership model; server applications supply their windows after connecting.
+#[test]
+fn remote_app_has_no_preconnection_desktop_windows() {
+    let parsed = parse_viewer_config_from_rdp(
+        "full address:s:rdp.example.com\nusername:s:test\nClearTextPassword:s:test\nremoteapplicationmode:i:1\nremoteapplicationprogram:s:||notepad\n",
+        &[],
+    );
+    assert!(parsed.desktop_options().is_none());
+    assert!(parsed.into_config().unwrap().connector().remote_application_mode);
+}
+
 #[test]
 fn gateway_is_disabled_when_gateway_usage_method_is_zero() {
     let config = parse_config_from_rdp(
