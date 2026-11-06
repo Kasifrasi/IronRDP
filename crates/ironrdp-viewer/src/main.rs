@@ -58,10 +58,20 @@ fn main() -> anyhow::Result<()> {
     let event_loop_proxy = event_loop.create_proxy();
     let (output_event_sender, mut output_event_receiver) = output_channel(64);
     let remote_app = config.connector().remote_application_mode;
-    let initial_window_size = PhysicalSize::new(
-        u32::from(config.connector().desktop_size.width),
-        u32::from(config.connector().desktop_size.height),
-    );
+    let monitor_layout = config.connector().monitor_layout.as_ref();
+    let multiple_monitors = monitor_layout.is_some_and(|layout| 1 < layout.monitors.len());
+    let initial_window_size = if multiple_monitors {
+        let monitor = &monitor_layout.expect("multiple monitors require a layout").monitors[0];
+        PhysicalSize::new(
+            u32::try_from(monitor.right - monitor.left + 1)?,
+            u32::try_from(monitor.bottom - monitor.top + 1)?,
+        )
+    } else {
+        PhysicalSize::new(
+            u32::from(config.connector().desktop_size.width),
+            u32::from(config.connector().desktop_size.height),
+        )
+    };
 
     #[cfg(windows)]
     let enable_smartcard = config.channels().rdpdr.smartcard;
@@ -72,6 +82,11 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     let drives = ironrdp_viewer::drives::ViewerDrives::from_rdpdr_config(&config.channels().rdpdr, named_drives);
     let client = RdpClient::new(config, output_event_sender);
+    let client = if multiple_monitors {
+        client.with_desktop_updates()
+    } else {
+        client
+    };
     #[cfg(windows)]
     let (client, _drive_watcher) =
         attach_windows_rdpdr_backend(client, enable_smartcard, printers.as_ref(), &ports, &drives, &server)?;
@@ -82,6 +97,9 @@ fn main() -> anyhow::Result<()> {
 
     let mut app = App::new(&event_loop, &input_event_sender, initial_window_size, remote_app)
         .context("unable to initialize App")?;
+    if multiple_monitors {
+        app = app.with_monitor_windows();
+    }
 
     let rt = runtime::Builder::new_multi_thread()
         .enable_all()

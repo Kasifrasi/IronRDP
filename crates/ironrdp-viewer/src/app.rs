@@ -24,6 +24,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHan
 use winit::keyboard::PhysicalKey;
 use winit::window::{Cursor, CursorIcon, CustomCursor, Window, WindowAttributes};
 
+use crate::desktop::MonitorWindows;
 use crate::keymap::{is_modifier, map_key_code};
 use crate::rail::{RailWindows, bounded_window_size, window_point_to_desktop};
 
@@ -59,6 +60,7 @@ pub struct RpcApp {
     context: softbuffer::Context<OwnedDisplayHandle>,
     initial_window_size: PhysicalSize<u32>,
     window: Option<WindowSurface>,
+    monitor_windows: Option<MonitorWindows>,
     buffer: Vec<u32>,
     buffer_size: (u16, u16),
     input_database: ironrdp::input::Database,
@@ -108,6 +110,13 @@ impl App {
         )?;
         Ok(Self { inner })
     }
+
+    /// Shows each server monitor in its own window, with local resizing scaling that monitor's view.
+    #[must_use]
+    pub fn with_monitor_windows(mut self) -> Self {
+        self.inner.monitor_windows = Some(MonitorWindows::new(self.inner.initial_window_size));
+        self
+    }
 }
 
 impl RpcApp {
@@ -144,6 +153,7 @@ impl RpcApp {
             context,
             initial_window_size,
             window: None,
+            monitor_windows: None,
             buffer: Vec::new(),
             buffer_size: (0, 0),
             input_database,
@@ -190,6 +200,9 @@ impl RpcApp {
 
     /// Sends the touch frames gathered since the last call as one RDPEI touch event.
     fn send_touch_frames(&mut self) {
+        if self.monitor_windows.is_some() && self.release_pending {
+            return;
+        }
         let InputTarget::Direct(input_event_sender) = &self.input_target else {
             return;
         };
@@ -216,6 +229,10 @@ impl RpcApp {
             return;
         };
         let position = desktop_position(window.inner_size(), self.buffer_size, touch.location);
+        self.handle_touch_at(touch, position);
+    }
+
+    fn handle_touch_at(&mut self, touch: event::Touch, position: ironrdp::input::MousePosition) {
         let phase = match touch.phase {
             event::TouchPhase::Started => TouchPhase::Started,
             event::TouchPhase::Moved => TouchPhase::Moved,
@@ -282,6 +299,11 @@ impl RpcApp {
 
     /// Sends the emulated mouse input from touch, keeping it while the session input queue is full.
     fn send_touch_mouse(&mut self) {
+        // UNTESTED: after focus loss, queued touch transitions wait for held-input release.
+        // Keep collecting transitions while it is pending; verify dragging with a saturated input queue.
+        if self.monitor_windows.is_some() && self.release_pending {
+            return;
+        }
         if !self.pending_touch_mouse.is_empty()
             && apply_and_send_fast_path_events(
                 &self.input_target,
@@ -395,9 +417,9 @@ impl RpcApp {
         sb_buffer.present().expect("buffer present");
     }
     fn on_about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.send_pending_rail_input();
         self.send_touch_frames();
         self.send_touch_mouse();
-        self.send_pending_rail_input();
         // Input that found the session input queue full is retried shortly, since draining the queue
         // does not wake the event loop.
         // Frames held for a suspended server wait for the resume event, which wakes the loop.
@@ -422,6 +444,13 @@ impl RpcApp {
     }
 
     fn on_resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(monitors) = &mut self.monitor_windows {
+            if let Err(error) = monitors.sync_windows(event_loop, &self.context) {
+                error!(%error, "Failed to create monitor windows");
+                event_loop.exit();
+            }
+            return;
+        }
         if self.remote_app || self.window.is_some() {
             return;
         }
@@ -446,10 +475,14 @@ impl RpcApp {
 
     fn on_window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
+        event_loop: &ActiveEventLoop,
         window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        if self.monitor_windows.is_some() {
+            self.on_monitor_window_event(event_loop, window_id, event);
+            return;
+        }
         let Some((window, _)) = self.window.as_mut().filter(|(window, _)| window.id() == window_id) else {
             if let Some(rail_window_id) = self.rail_windows.find(window_id) {
                 self.on_rail_window_event(rail_window_id, event);
@@ -640,8 +673,82 @@ impl RpcApp {
         }
     }
 
+    fn on_monitor_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if self
+            .monitor_windows
+            .as_ref()
+            .is_none_or(|monitors| monitors.window(window_id).is_none())
+        {
+            return;
+        }
+        match event {
+            WindowEvent::CloseRequested => {
+                self.close_requested = true;
+                if let InputTarget::Direct(sender) = &self.input_target {
+                    sender.request_graceful_close();
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                if let Some(monitors) = &mut self.monitor_windows
+                    && let Err(error) = monitors.draw(window_id)
+                {
+                    error!(%error, "Failed to draw monitor");
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(window) = self
+                    .monitor_windows
+                    .as_ref()
+                    .and_then(|monitors| monitors.window(window_id))
+                {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::Focused(false) => {
+                self.release_touch();
+                self.release_pending = true;
+                self.send_pending_rail_input();
+            }
+            WindowEvent::Touch(touch) => {
+                self.send_pending_rail_input();
+                if let Some(position) = self
+                    .monitor_windows
+                    .as_ref()
+                    .and_then(|monitors| monitors.position(window_id, touch.location))
+                {
+                    self.handle_touch_at(touch, position);
+                }
+            }
+            input if is_input_event(&input) => {
+                if matches!(input, WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. })
+                    && is_touch_or_pen_mouse_message()
+                {
+                    return;
+                }
+                self.send_pending_rail_input();
+                if self.release_pending {
+                    return;
+                }
+                let monitors = self.monitor_windows.as_ref();
+                let to_session =
+                    |x, y| monitors.and_then(|monitors| monitors.position(window_id, PhysicalPosition::new(x, y)));
+                forward_input_event(&self.input_target, &mut self.input_database, &input, &to_session);
+            }
+            _ => {}
+        }
+    }
+
     /// Applies a server pointer shape to every local window and shows the pointer.
     fn set_cursor(&mut self, cursor: Cursor) {
+        if let Some(monitors) = &mut self.monitor_windows {
+            monitors.set_cursor(cursor.clone());
+        }
         if let Some((window, _)) = &self.window {
             window.set_cursor(cursor.clone());
             window.set_cursor_visible(true);
@@ -657,6 +764,16 @@ impl RpcApp {
             }
             RdpOutputEvent::MonitorLayout(monitors) => {
                 debug!(monitor_count = monitors.len(), "Received remote monitor layout");
+                if self.monitor_windows.is_some() {
+                    self.release_touch();
+                    let windows = self.monitor_windows.as_mut().expect("monitor mode checked above");
+                    if let Err(error) = windows.set_layout(event_loop, &self.context, &monitors) {
+                        error!(%error, "Failed to apply monitor layout");
+                        event_loop.exit();
+                    }
+                    self.release_pending = true;
+                    self.send_pending_rail_input();
+                }
             }
             RdpOutputEvent::MonitorLayoutRejected => {
                 warn!("The server cannot accept the requested monitor layout");
@@ -712,6 +829,9 @@ impl RpcApp {
                 event_loop.exit();
             }
             RdpOutputEvent::PointerHidden => {
+                if let Some(monitors) = &mut self.monitor_windows {
+                    monitors.hide_cursor();
+                }
                 if let Some((window, _)) = &self.window {
                     window.set_cursor_visible(false);
                 }
@@ -721,6 +841,9 @@ impl RpcApp {
                 self.set_cursor(Cursor::from(CursorIcon::default()));
             }
             RdpOutputEvent::PointerPosition { x, y } => {
+                if let Some(monitors) = &self.monitor_windows {
+                    monitors.move_cursor(x, y);
+                }
                 // A RemoteApp session has no single window the desktop position maps into.
                 if let Some((window, _)) = &self.window
                     && let Err(error) = window.set_cursor_position(LogicalPosition::new(x, y))
@@ -742,6 +865,9 @@ impl RpcApp {
                 }
             }
             RdpOutputEvent::DisplayResizeFallback(reason) => {
+                if let Some(monitors) = &mut self.monitor_windows {
+                    monitors.reset();
+                }
                 warn!(
                     ?reason,
                     "Reconnecting because dynamic display resize could not complete"
@@ -850,9 +976,25 @@ impl RpcApp {
                     );
                 }
             }
-            // Only produced when the client is built with `.with_desktop_updates()`, which the
-            // viewer does not opt into: it always presents full-frame `Image` snapshots instead.
-            RdpOutputEvent::DesktopUpdate(_) => {}
+            RdpOutputEvent::DesktopUpdate(update) => {
+                if self
+                    .monitor_windows
+                    .as_ref()
+                    .is_some_and(|monitors| monitors.frame_size() != (update.width().get(), update.height().get()))
+                {
+                    // UNTESTED: a new extent can remove a focused monitor window without a layout event.
+                    // Release held input before replacing windows; check this on reactivation without monitor definitions.
+                    self.release_touch();
+                    self.release_pending = true;
+                    self.send_pending_rail_input();
+                }
+                if let Some(monitors) = &mut self.monitor_windows
+                    && let Err(error) = monitors.update(event_loop, &self.context, &update)
+                {
+                    error!(%error, "Failed to apply desktop update");
+                    event_loop.exit();
+                }
+            }
             // Only produced when the virtual desktop control channel is configured, which the viewer does not do.
             RdpOutputEvent::SwitchToLocalRequested => debug!("Cloud PC requested a switch to the local desktop"),
             RdpOutputEvent::LocalActionRequested(action) => debug!(?action, "Cloud PC requested a local action"),
