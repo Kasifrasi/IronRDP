@@ -24,6 +24,19 @@ You can provide the hostname and credentials through environment variables inste
 RDP_HOSTNAME=<HOSTNAME> RDP_USERNAME=<USERNAME> RDP_PASSWORD=<PASSWORD> ironrdp-viewer
 ```
 
+To open three virtual monitors over one connection:
+
+```shell
+ironrdp-viewer <HOSTNAME> --username <USERNAME> --monitor-count 3 --desktop-width 1280 --desktop-height 800
+```
+
+Each monitor is 1280×800, arranged horizontally with the first monitor primary.
+The viewer opens a window for each monitor reported by the server.
+Resizing a local window scales that monitor's view; closing any monitor window closes the connection.
+If the server supplies no usable monitor layout, one window shows the combined desktop and its title identifies the fallback.
+This mode supports 2–16 virtual monitors and requires explicit per-monitor dimensions.
+It is available in direct desktop mode; RemoteApp and RPC mode use their existing window behavior.
+
 On Windows, the viewer redirects local drives:
 
 - `--drives` redirects every drive, including drives connected later (`drivestoredirect:s:*`).

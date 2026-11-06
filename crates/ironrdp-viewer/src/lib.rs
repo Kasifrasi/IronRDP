@@ -12,6 +12,7 @@
 pub mod app;
 pub mod cli;
 pub mod clipboard;
+mod desktop;
 #[cfg(windows)]
 pub mod drives;
 mod keymap;
