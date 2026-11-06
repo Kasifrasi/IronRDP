@@ -17,10 +17,10 @@ use ironrdp::pdu::window::{
     DesktopOrder, IconInfo, IconSource, MonitoredDesktop, ShowState, WindowIcon, WindowOrder, WindowOrderBody,
     WindowState, WindowingOrder,
 };
-use raw_window_handle::DisplayHandle;
 use tracing::{debug, warn};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::OwnedDisplayHandle;
 use winit::window::{Cursor, Icon, Window, WindowAttributes, WindowId};
 
 /// Upper bound on local windows created for server windows.
@@ -344,7 +344,7 @@ fn pixel_to_rgba(pixel: &[u8], palette: impl Fn(u8) -> [u8; 3]) -> [u8; 4] {
     }
 }
 
-type Surface = softbuffer::Surface<DisplayHandle<'static>, Arc<Window>>;
+type Surface = softbuffer::Surface<OwnedDisplayHandle, Arc<Window>>;
 
 struct LocalWindow {
     window: Arc<Window>,
@@ -379,7 +379,7 @@ impl RailWindows {
     pub(crate) fn apply_orders(
         &mut self,
         event_loop: &ActiveEventLoop,
-        context: &softbuffer::Context<DisplayHandle<'static>>,
+        context: &softbuffer::Context<OwnedDisplayHandle>,
         orders: Vec<WindowingOrder>,
     ) {
         for order in orders {
@@ -415,7 +415,7 @@ impl RailWindows {
     fn apply_window_order(
         &mut self,
         event_loop: &ActiveEventLoop,
-        context: &softbuffer::Context<DisplayHandle<'static>>,
+        context: &softbuffer::Context<OwnedDisplayHandle>,
         order: WindowOrder,
     ) {
         let window_id = order.window_id;
@@ -542,7 +542,7 @@ impl RailWindows {
     fn sync_local_window(
         &mut self,
         event_loop: &ActiveEventLoop,
-        context: &softbuffer::Context<DisplayHandle<'static>>,
+        context: &softbuffer::Context<OwnedDisplayHandle>,
         window_id: u32,
         changes: ModelChanges,
     ) {
@@ -637,7 +637,7 @@ impl RailWindows {
     fn attach_owned_windows(
         &mut self,
         event_loop: &ActiveEventLoop,
-        context: &softbuffer::Context<DisplayHandle<'static>>,
+        context: &softbuffer::Context<OwnedDisplayHandle>,
         owner_window_id: u32,
     ) {
         if !OWNER_WINDOWS_SUPPORTED {
@@ -669,7 +669,7 @@ impl RailWindows {
     fn recreate_with_owned(
         &mut self,
         event_loop: &ActiveEventLoop,
-        context: &softbuffer::Context<DisplayHandle<'static>>,
+        context: &softbuffer::Context<OwnedDisplayHandle>,
         window_id: u32,
     ) {
         let mut subtree = vec![window_id];
@@ -830,7 +830,7 @@ impl RailWindows {
 
 fn create_local_window(
     event_loop: &ActiveEventLoop,
-    context: &softbuffer::Context<DisplayHandle<'static>>,
+    context: &softbuffer::Context<OwnedDisplayHandle>,
     model: &RailWindowModel,
     owner: Option<&Window>,
 ) -> anyhow::Result<LocalWindow> {

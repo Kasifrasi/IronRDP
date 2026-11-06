@@ -7,7 +7,6 @@ use core::time::Duration;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Context as _;
 use ironrdp::client::rail::RailInputEvent;
 use ironrdp::client::rdp::{
     AutoReconnectDecision, RDPEI_MAX_TOUCH_CONTACTS, RdpInputEvent, RdpInputSender, RdpOutputEvent,
@@ -16,13 +15,12 @@ use ironrdp::rdpei::RdpeiInputState;
 use ironrdp::rdpei::contact::{TouchFrameBuilder, TouchPhase};
 use ironrdp_daemon::daemon::{Daemon, ResizeError};
 use ironrdp_rail::pdu::{ActivatePdu, SystemCommand, SystemCommandPdu};
-use raw_window_handle::{DisplayHandle, HasDisplayHandle as _};
 use smallvec::SmallVec;
 use tracing::{debug, error, info, trace, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize};
 use winit::event::{self, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHandle};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Cursor, CursorIcon, CustomCursor, Window, WindowAttributes};
 
@@ -35,7 +33,7 @@ const MAX_PENDING_TOUCH_MOUSE: usize = 256;
 /// RAIL controls kept while the session input queue is full; beyond this, the oldest is dropped.
 const MAX_PENDING_RAIL_INPUTS: usize = 64;
 
-type WindowSurface = (Arc<Window>, softbuffer::Surface<DisplayHandle<'static>, Arc<Window>>);
+type WindowSurface = (Arc<Window>, softbuffer::Surface<OwnedDisplayHandle, Arc<Window>>);
 
 /// Events delivered from the viewer-hosted RPC server to the window.
 pub enum ViewerEvent {
@@ -58,7 +56,7 @@ pub struct App {
 pub struct RpcApp {
     input_target: InputTarget,
     frame_wakeup: Option<Arc<AtomicBool>>,
-    context: softbuffer::Context<DisplayHandle<'static>>,
+    context: softbuffer::Context<OwnedDisplayHandle>,
     initial_window_size: PhysicalSize<u32>,
     window: Option<WindowSurface>,
     buffer: Vec<u32>,
@@ -136,14 +134,7 @@ impl RpcApp {
         initial_window_size: PhysicalSize<u32>,
         remote_app: bool,
     ) -> anyhow::Result<Self> {
-        // SAFETY: We drop the softbuffer context right before the event loop is stopped, thus making this safe.
-        // FIXME: This is not a sufficient proof and the API is actually unsound as-is.
-        let display_handle = unsafe {
-            core::mem::transmute::<DisplayHandle<'_>, DisplayHandle<'static>>(
-                event_loop.display_handle().context("get display handle")?,
-            )
-        };
-        let context = softbuffer::Context::new(display_handle)
+        let context = softbuffer::Context::new(event_loop.owned_display_handle())
             .map_err(|e| anyhow::anyhow!("unable to initialize softbuffer context: {e}"))?;
 
         let input_database = ironrdp::input::Database::new();
