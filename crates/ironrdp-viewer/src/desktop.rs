@@ -10,7 +10,7 @@ use winit::event_loop::{ActiveEventLoop, OwnedDisplayHandle};
 use winit::window::{Cursor, Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::cli::MonitorLayoutMode;
-use crate::monitor::{DesktopFrame, MonitorLayout, MonitorResizeState, MonitorViewport, OutputGeometry};
+use crate::monitor::{DesktopFrame, MonitorDamage, MonitorLayout, MonitorResizeState, MonitorViewport, OutputGeometry};
 use crate::outputs::SelectedOutput;
 use crate::rail::bounded_window_size;
 
@@ -26,6 +26,7 @@ struct DesktopWindow {
     surface: Surface,
     viewport: Option<MonitorViewport>,
     presented_size: Option<PhysicalSize<u32>>,
+    damage: MonitorDamage,
 }
 
 /// Presents a shared desktop in windows using the server's monitor definitions.
@@ -220,12 +221,13 @@ impl MonitorWindows {
     }
 
     pub(crate) fn resized(&mut self, id: WindowId, size: PhysicalSize<u32>) -> anyhow::Result<bool> {
+        let Some(view) = self.windows.iter_mut().find(|view| view.window.id() == id) else {
+            return Ok(false);
+        };
+        view.damage.resize((size.width, size.height));
         if self.layout_mode == MonitorLayoutMode::Local {
             return Ok(false);
         }
-        let Some(view) = self.windows.iter().find(|view| view.window.id() == id) else {
-            return Ok(false);
-        };
         self.resizes.resized(view.remote_index, (size.width, size.height))
     }
 
@@ -252,6 +254,7 @@ impl MonitorWindows {
         self.awaiting_frame = true;
         for view in &mut self.windows {
             view.viewport = None;
+            view.damage.invalidate();
             view.window.set_title("IronRDP - Waiting for monitor layout");
             view.window.request_redraw();
         }
@@ -321,12 +324,14 @@ impl MonitorWindows {
             self.sync_windows(event_loop, context)?;
         } else {
             let region = update.region();
-            for view in &self.windows {
+            for view in &mut self.windows {
                 let size = view.window.inner_size();
-                if view
+                view.damage.resize((size.width, size.height));
+                if let Some(damage) = view
                     .viewport
-                    .is_some_and(|viewport| viewport.damage_region(&region, (size.width, size.height)).is_some())
+                    .and_then(|viewport| viewport.damage_region(&region, (size.width, size.height)))
                 {
+                    view.damage.add(damage);
                     view.window.request_redraw();
                 }
             }
@@ -387,6 +392,7 @@ impl MonitorWindows {
             if let Some(view) = self.windows.iter_mut().find(|view| view.monitor_id == monitor_id) {
                 view.remote_index = index;
                 view.viewport = viewport;
+                view.damage.invalidate();
                 view.window.set_title(&title);
                 view.window.request_redraw();
             } else {
@@ -417,6 +423,7 @@ impl MonitorWindows {
                     surface,
                     viewport,
                     presented_size: None,
+                    damage: MonitorDamage::default(),
                 });
             }
         }
@@ -439,28 +446,56 @@ impl MonitorWindows {
         if bounded_window_size(size.width, size.height) != (size.width, size.height) {
             return Ok(());
         }
-        view.surface
-            .resize(width, height)
-            .map_err(|error| anyhow::anyhow!("unable to resize monitor surface: {error}"))?;
+        if view.presented_size != Some(size) {
+            view.damage.invalidate();
+            view.surface
+                .resize(width, height)
+                .map_err(|error| anyhow::anyhow!("unable to resize monitor surface: {error}"))?;
+        }
         let mut buffer = view
             .surface
             .buffer_mut()
             .map_err(|error| anyhow::anyhow!("unable to acquire monitor buffer: {error}"))?;
-        buffer.fill(0);
-        if let Some(viewport) = &view.viewport
-            && !self.awaiting_frame
-        {
-            viewport.render(
-                self.frame.pixels(),
-                self.frame.size(),
-                &mut buffer,
-                (size.width, size.height),
-            );
+        // UNTESTED: backend buffer ages must match successful presentations for partial repairs.
+        // Check scrolling, occlusion, resize and reconnect on Wayland when changing this path.
+        let region = view.damage.repair_region(buffer.age(), (size.width, size.height));
+        if let Some(region) = &region {
+            if let Some(viewport) = &view.viewport
+                && !self.awaiting_frame
+            {
+                anyhow::ensure!(
+                    viewport.render_region(
+                        self.frame.pixels(),
+                        self.frame.size(),
+                        &mut buffer,
+                        (size.width, size.height),
+                        region,
+                    ),
+                    "invalid monitor paint region"
+                );
+            } else {
+                for row in u32::from(region.top)..u32::from(region.bottom) {
+                    let start = usize::try_from(row * size.width + u32::from(region.left))?;
+                    let end = start + usize::from(region.right - region.left);
+                    buffer[start..end].fill(0);
+                }
+            }
         }
-        buffer
-            .present()
+        let result = match region {
+            Some(region) => buffer.present_with_damage(&[softbuffer::Rect {
+                x: u32::from(region.left),
+                y: u32::from(region.top),
+                width: core::num::NonZeroU32::new(u32::from(region.right - region.left))
+                    .context("empty paint width")?,
+                height: core::num::NonZeroU32::new(u32::from(region.bottom - region.top))
+                    .context("empty paint height")?,
+            }]),
+            None => buffer.present(),
+        };
+        result
             .map_err(|error| anyhow::anyhow!("unable to present monitor buffer: {error}"))
             .context("monitor redraw")?;
+        view.damage.presented((size.width, size.height));
         view.presented_size = Some(size);
         Ok(())
     }
