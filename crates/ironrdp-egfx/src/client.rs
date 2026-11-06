@@ -789,11 +789,12 @@ impl GraphicsPipelineClient {
                 Ok(vec![])
             }
             GfxPdu::WireToSurface1(wire) => {
+                trace!(?wire, "WireToSurface1");
                 self.handle_wire_to_surface1(wire)?;
                 Ok(vec![])
             }
             GfxPdu::WireToSurface2(pdu) => {
-                trace!("WireToSurface2 (progressive codec)");
+                trace!(?pdu, "WireToSurface2 (progressive codec)");
                 self.handler.on_wire_to_surface2(&pdu);
                 self.handle_wire_to_surface2(pdu)?;
                 Ok(vec![])
@@ -1341,6 +1342,7 @@ impl GraphicsPipelineClient {
     fn decode_avc420(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
+        trace!(surface_id, ?stream, "AVC420 update");
 
         let Some(decoder) = self.surface_h264_decoder(surface_id)? else {
             debug!("No H.264 decoder configured, skipping AVC420 frame");
@@ -1490,7 +1492,7 @@ impl GraphicsPipelineClient {
             .map(|surface| (surface.width, surface.height))
             .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface1"))?;
 
-        trace!(surface_id, ?codec_id, encoding = ?stream.encoding, "AVC444 update");
+        trace!(surface_id, ?codec_id, encoding = ?stream.encoding, ?stream, "AVC444 update");
         let (main, auxiliary) = match stream.encoding {
             Encoding::LUMA => (Some(&stream.stream1), None),
             Encoding::CHROMA => (None, Some(&stream.stream1)),
