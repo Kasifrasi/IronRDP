@@ -11,14 +11,14 @@ use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_session::image::DecodedImage;
-use ironrdp_session::{ActiveStage, composite_graphics_updates};
+use ironrdp_session::{ActiveStage, ActiveStageOutput, composite_graphics_updates};
 
 // oracle: mutant missed, duplicate or size-only graphics output reset notifications
 #[rstest::rstest]
 #[case::tcp(deliver_tcp_graphics_reset)]
 #[case::reliable_udp(deliver_udp_graphics_reset)]
 fn output_resets_are_reported_without_a_completed_frame(
-    #[case] deliver: fn(&mut ActiveStage, &mut DecodedImage, &[u8]),
+    #[case] deliver: fn(&mut ActiveStage, &mut DecodedImage, &[u8]) -> Vec<ActiveStageOutput>,
 ) {
     use ironrdp_core::encode_vec;
     use ironrdp_dvc::DrdynvcClient;
@@ -26,6 +26,7 @@ fn output_resets_are_reported_without_a_completed_frame(
     use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
     use ironrdp_egfx::pdu::{GfxPdu, ResetGraphicsPdu};
     use ironrdp_graphics::zgfx::wrap_uncompressed;
+    use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
     use ironrdp_session::ActiveStageBuilder;
     use ironrdp_svc::{StaticChannelSet, SvcProcessor as _};
 
@@ -59,11 +60,27 @@ fn output_resets_are_reported_without_a_completed_frame(
     let mut image = DecodedImage::new(PixelFormat::RgbA32, 800, 600);
     assert_eq!(stage.take_graphics_output_reset(), None);
 
-    for (width, height) in [(800, 600), (1024, 768), (1024, 768)] {
+    for (width, height, secondary_left) in [(800, 600, 400), (1024, 768, 512), (1024, 768, -512)] {
+        let monitors = vec![
+            Monitor {
+                left: 0,
+                top: 0,
+                right: i32::from(width / 2) - 1,
+                bottom: i32::from(height) - 1,
+                flags: MonitorFlags::PRIMARY,
+            },
+            Monitor {
+                left: secondary_left,
+                top: 0,
+                right: secondary_left + i32::from(width / 2) - 1,
+                bottom: i32::from(height) - 1,
+                flags: MonitorFlags::empty(),
+            },
+        ];
         let reset = encode_vec(&GfxPdu::ResetGraphics(ResetGraphicsPdu {
             width: u32::from(width),
             height: u32::from(height),
-            monitors: Vec::new(),
+            monitors: monitors.clone(),
         }))
         .unwrap();
         let data = encode_vec(&DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
@@ -71,7 +88,13 @@ fn output_resets_are_reported_without_a_completed_frame(
             wrap_uncompressed(&reset),
         ))))
         .unwrap();
-        deliver(&mut stage, &mut image, &data);
+        let outputs = deliver(&mut stage, &mut image, &data);
+        // oracle: spec MS-RDPEGFX §2.2.2.14 (ResetGraphics also updates the monitor layout)
+        assert!(
+            outputs
+                .iter()
+                .any(|output| { matches!(output, ActiveStageOutput::MonitorLayout(actual) if actual == &monitors) })
+        );
         // oracle: spec MS-RDPEGFX v19.0 §3.3.5.14 (ResetGraphics resizes the output buffer)
         assert_eq!((image.width(), image.height()), (width, height));
         assert_eq!(stage.take_graphics_output_reset(), Some((width, height)));
@@ -83,7 +106,11 @@ fn output_resets_are_reported_without_a_completed_frame(
     }
 }
 
-fn deliver_tcp_graphics_reset(stage: &mut ActiveStage, image: &mut DecodedImage, data: &[u8]) {
+fn deliver_tcp_graphics_reset(
+    stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    data: &[u8],
+) -> Vec<ActiveStageOutput> {
     use std::borrow::Cow;
 
     use ironrdp_core::encode_vec;
@@ -104,10 +131,14 @@ fn deliver_tcp_graphics_reset(stage: &mut ActiveStage, image: &mut DecodedImage,
         user_data: Cow::Owned(user_data),
     }))
     .unwrap();
-    stage.process(image, Action::X224, &frame, None).unwrap();
+    stage.process(image, Action::X224, &frame, None).unwrap()
 }
 
-fn deliver_udp_graphics_reset(stage: &mut ActiveStage, image: &mut DecodedImage, data: &[u8]) {
+fn deliver_udp_graphics_reset(
+    stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    data: &[u8],
+) -> Vec<ActiveStageOutput> {
     use ironrdp_core::encode_vec;
     use ironrdp_dvc::DrdynvcClient;
     use ironrdp_dvc::pdu::{DrdynvcServerPdu, SoftSyncChannelList, SoftSyncRequestPdu, SoftSyncTunnelType};
@@ -127,7 +158,8 @@ fn deliver_udp_graphics_reset(stage: &mut ActiveStage, image: &mut DecodedImage,
     }
     stage
         .process_dvc_tunnel(image, SoftSyncTunnelType::RELIABLE_UDP, data)
-        .unwrap();
+        .unwrap()
+        .1
 }
 
 fn update(left: u16, top: u16, right: u16, bottom: u16) -> (ExclusiveRectangle, Vec<u8>) {

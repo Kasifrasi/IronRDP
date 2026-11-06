@@ -303,7 +303,7 @@ impl ActiveStage {
                 // Soft-Sync tunnel, see `process_dvc_tunnel`), so the compositor is drained here
                 // rather than in the Action::FastPath arm, which runs on every fast-path frame
                 // (the highest-frequency path in a session).
-                let (region, window_updates) = self.drain_graphics_pipeline(image)?;
+                let (region, window_updates) = self.drain_graphics_pipeline(image, &mut stage_outputs)?;
                 if let Some(region) = region {
                     stage_outputs.push(ActiveStageOutput::GraphicsUpdate(region));
                 }
@@ -393,6 +393,7 @@ impl ActiveStage {
     fn drain_graphics_pipeline(
         &mut self,
         image: &mut DecodedImage,
+        stage_outputs: &mut Vec<ActiveStageOutput>,
     ) -> SessionResult<(Option<InclusiveRectangle>, Vec<WindowUpdate>)> {
         let Some(composited) = self
             .get_dvc_mut::<GraphicsPipelineClient>()
@@ -404,6 +405,9 @@ impl ActiveStage {
         if composited.reset {
             self.graphics_output_reset = Some((image.width(), image.height()));
             self.graphics_output_needs_full_refresh = true;
+        }
+        if let Some(monitors) = composited.monitors {
+            stage_outputs.push(ActiveStageOutput::MonitorLayout(monitors));
         }
         self.damage_regions.extend(composited.regions);
         Ok((composited.region, composited.window_updates))
@@ -718,7 +722,7 @@ impl ActiveStage {
             .process_tunnel(tunnel_type, payload)
             .map_err(SessionError::pdu)?;
         let mut stage_outputs = Vec::new();
-        let (region, window_updates) = self.drain_graphics_pipeline(image)?;
+        let (region, window_updates) = self.drain_graphics_pipeline(image, &mut stage_outputs)?;
         if let Some(region) = region {
             stage_outputs.push(ActiveStageOutput::GraphicsUpdate(region));
         }
@@ -1235,6 +1239,9 @@ pub struct CompositedGraphics {
     /// caller remembers the reset and repaints the whole image at its next
     /// paint, as [`ActiveStage`] does with its next graphics update.
     pub reset: bool,
+    /// The server monitor layout applied by this reset, before any resulting graphics updates.
+    /// An empty layout means the server supplied no monitor definitions.
+    pub monitors: Option<Vec<Monitor>>,
     /// The union of the regions changed, or `None` when nothing changed.
     pub region: Option<InclusiveRectangle>,
     /// Each region changed.
@@ -1279,6 +1286,7 @@ pub fn composite_graphics_pipeline(
         composite_graphics_updates(image, gfx.drain_output().into_iter().map(|u| (u.region, u.data)))?;
     Ok(CompositedGraphics {
         reset: output_reset.is_some(),
+        monitors: output_reset.map(|_| gfx.output_monitors().to_vec()),
         region,
         regions,
         window_updates: gfx.drain_window_updates(),
