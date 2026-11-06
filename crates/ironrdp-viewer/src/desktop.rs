@@ -9,7 +9,8 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event_loop::{ActiveEventLoop, OwnedDisplayHandle};
 use winit::window::{Cursor, Fullscreen, Window, WindowAttributes, WindowId};
 
-use crate::monitor::{DesktopFrame, MonitorLayout, MonitorResizeState, MonitorViewport};
+use crate::cli::MonitorLayoutMode;
+use crate::monitor::{DesktopFrame, MonitorLayout, MonitorResizeState, MonitorViewport, OutputGeometry};
 use crate::outputs::SelectedOutput;
 use crate::rail::bounded_window_size;
 
@@ -33,6 +34,8 @@ pub(crate) struct MonitorWindows {
     preferred_primary: MonitorId,
     outputs: Vec<SelectedOutput>,
     fullscreen: bool,
+    layout_mode: MonitorLayoutMode,
+    requested_layout: Option<MonitorLayout>,
     layout: Option<MonitorLayout>,
     frame: DesktopFrame,
     awaiting_frame: bool,
@@ -43,9 +46,15 @@ pub(crate) struct MonitorWindows {
 }
 
 impl MonitorWindows {
-    pub(crate) fn set_outputs(&mut self, outputs: Vec<SelectedOutput>, fullscreen: bool) {
+    pub(crate) fn set_outputs(
+        &mut self,
+        outputs: Vec<SelectedOutput>,
+        fullscreen: bool,
+        layout_mode: MonitorLayoutMode,
+    ) {
         self.outputs = outputs;
         self.fullscreen = fullscreen;
+        self.layout_mode = layout_mode;
     }
 
     pub(crate) fn prepare(&mut self, layout: MonitorLayout) {
@@ -57,7 +66,33 @@ impl MonitorWindows {
                 .unwrap_or(0),
         );
         self.resizes.set_layout(&layout);
+        self.requested_layout = Some(layout.clone());
         self.layout = Some(layout);
+    }
+
+    pub(crate) fn local_layout(&self) -> anyhow::Result<MonitorLayout> {
+        let geometries = self.outputs.iter().enumerate().map(|(index, output)| {
+            let view = self.windows.iter().find(|view| view.monitor_id == MonitorId(index))
+                .context("selected output has no monitor window")?;
+            let scale = view.window.scale_factor();
+            let output_scale = output.monitor.scale_factor();
+            anyhow::ensure!(
+                scale.is_finite() && 0.0 < scale && output_scale.is_finite() && 0.0 < output_scale,
+                "output scale is invalid"
+            );
+            // winit 0.30's Wayland backend scales logical origins with the integer wl_output scale.
+            // UNTESTED: undo that scale, rather than the fractional window scale; check when updating winit.
+            let position = output.monitor.position().to_logical::<i32>(output_scale);
+            let native = view.window.inner_size();
+            let logical = native.to_logical::<u32>(scale);
+            tracing::debug!(output = %output.name, ?position, ?logical, ?native, scale, "Resolved local output geometry");
+            Ok(OutputGeometry {
+                position: (position.x, position.y),
+                logical_size: (logical.width, logical.height),
+                native_size: (native.width, native.height),
+            })
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        MonitorLayout::from_local_outputs(&geometries, self.preferred_primary.0)
     }
 
     pub(crate) fn native_sizes(&self) -> Option<Vec<(u32, u32)>> {
@@ -130,6 +165,8 @@ impl MonitorWindows {
             preferred_primary: MonitorId(0),
             outputs: Vec::new(),
             fullscreen: false,
+            layout_mode: MonitorLayoutMode::Horizontal,
+            requested_layout: None,
             layout: None,
             frame: DesktopFrame::default(),
             awaiting_frame: true,
@@ -160,6 +197,9 @@ impl MonitorWindows {
     }
 
     pub(crate) fn resized(&mut self, id: WindowId, size: PhysicalSize<u32>) -> anyhow::Result<bool> {
+        if self.layout_mode == MonitorLayoutMode::Local {
+            return Ok(false);
+        }
         let Some(view) = self.windows.iter().find(|view| view.window.id() == id) else {
             return Ok(false);
         };
@@ -208,9 +248,25 @@ impl MonitorWindows {
         } else {
             match MonitorLayout::new(monitors) {
                 Ok(mut layout) => {
-                    layout.order_horizontal();
-                    info!(monitor_count = layout.monitors().len(), "Using server monitor layout");
-                    Some(layout)
+                    let known = match self.layout_mode {
+                        MonitorLayoutMode::Local => self
+                            .requested_layout
+                            .as_ref()
+                            .is_some_and(|reference| layout.reorder_to_match(reference)),
+                        MonitorLayoutMode::Horizontal => {
+                            layout.order_horizontal();
+                            true
+                        }
+                    };
+                    if known {
+                        info!(monitor_count = layout.monitors().len(), "Using server monitor layout");
+                        Some(layout)
+                    } else {
+                        warn!(
+                            "Server monitor geometry differs from the requested local layout; showing the combined desktop"
+                        );
+                        None
+                    }
                 }
                 Err(error) => {
                     warn!(%error, "Invalid server monitor layout; showing the combined desktop");

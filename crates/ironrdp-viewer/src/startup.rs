@@ -12,7 +12,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHan
 use winit::window::WindowId;
 
 use crate::app::{App, create_context};
-use crate::cli::DesktopOptions;
+use crate::cli::{DesktopOptions, MonitorLayoutMode};
 use crate::desktop::MonitorWindows;
 use crate::monitor::MonitorLayout;
 
@@ -54,6 +54,10 @@ impl<'a> WindowedApp<'a> {
         anyhow::ensure!(
             !options.fullscreen || options.selection.is_some(),
             "fullscreen requires selected local outputs"
+        );
+        anyhow::ensure!(
+            options.monitor_layout != MonitorLayoutMode::Local || options.fullscreen,
+            "local monitor layout requires fullscreen"
         );
         let primary = options
             .layout
@@ -98,7 +102,10 @@ impl<'a> WindowedApp<'a> {
             .windows
             .native_sizes()
             .context("native windows are not drawable")?;
-        let layout = desktop.options.layout.fit_window_sizes(&sizes)?;
+        let layout = match desktop.options.monitor_layout {
+            MonitorLayoutMode::Local => desktop.windows.local_layout()?,
+            MonitorLayoutMode::Horizontal => desktop.options.layout.fit_window_sizes(&sizes)?,
+        };
         let scale_factor = desktop
             .options
             .scale_factor
@@ -145,7 +152,11 @@ impl ApplicationHandler<RdpOutputEvent> for WindowedApp<'_> {
                 if let Some(selection) = desktop.options.selection.take() {
                     match selection.resolve(event_loop) {
                         Ok((layout, outputs)) => {
-                            desktop.windows.set_outputs(outputs, desktop.options.fullscreen);
+                            desktop.windows.set_outputs(
+                                outputs,
+                                desktop.options.fullscreen,
+                                desktop.options.monitor_layout,
+                            );
                             desktop.windows.prepare(layout.clone());
                             desktop.options.layout = layout;
                         }
