@@ -620,6 +620,7 @@ impl PrinterOptions {
 /// + frontend-derived client identity) and build the strongly-typed [`Config`].
 pub struct ViewerConfig {
     builder: ConfigBuilder,
+    desktop: Option<DesktopOptions>,
 
     // CLI-only settings that are not representable as `.rdp` file properties.
     log_file: Option<String>,
@@ -631,6 +632,13 @@ pub struct ViewerConfig {
     ports: PortOptions,
     list_usb_devices: bool,
     list_audio_devices: bool,
+}
+
+/// Preferred window geometry and optional explicit desktop scaling.
+#[derive(Clone)]
+pub struct DesktopOptions {
+    pub layout: crate::monitor::MonitorLayout,
+    pub scale_factor: Option<u32>,
 }
 
 impl ViewerConfig {
@@ -651,6 +659,7 @@ impl ViewerConfig {
         if args.usb.iter().any(|rules| rules == "list") {
             return Ok(Self {
                 builder: ConfigBuilder::new(),
+                desktop: None,
                 log_file: args.log_file,
                 dump_rdp: None,
                 rpc: false,
@@ -741,6 +750,7 @@ impl ViewerConfig {
             return Ok(Self {
                 builder: ConfigBuilder::new(),
                 log_file,
+                desktop: None,
                 dump_rdp: None,
                 rpc: true,
                 rpc_endpoint: args.rpc_endpoint,
@@ -826,6 +836,37 @@ impl ViewerConfig {
             Some(usb)
         };
 
+        let desktop = if args.remote_app.is_some() || properties.remote_application_mode() == Some(true) {
+            None
+        } else {
+            let monitors = monitor_layout.as_ref().map_or_else(
+                || {
+                    let width = args
+                        .desktop_width
+                        .or_else(|| properties.desktop_width().ok().flatten())
+                        .unwrap_or(1280);
+                    let height = args
+                        .desktop_height
+                        .or_else(|| properties.desktop_height().ok().flatten())
+                        .unwrap_or(720);
+                    vec![Monitor {
+                        left: 0,
+                        top: 0,
+                        right: i32::from(width) - 1,
+                        bottom: i32::from(height) - 1,
+                        flags: MonitorFlags::PRIMARY,
+                    }]
+                },
+                |(_, layout)| layout.monitors.clone(),
+            );
+            Some(DesktopOptions {
+                layout: crate::monitor::MonitorLayout::new(&monitors)?,
+                scale_factor: args
+                    .scale_desktop
+                    .or_else(|| properties.desktop_scale_factor().ok().flatten()),
+            })
+        };
+
         // CLI arguments take precedence: apply them on top of the `.rdp`-derived builder.
         let mut builder = apply_cli_to_builder(builder, args, redirect_clipboard, redirect_webauthn);
         if let Some((width, layout)) = monitor_layout {
@@ -858,6 +899,7 @@ impl ViewerConfig {
 
         Ok(Self {
             builder,
+            desktop,
             log_file,
             dump_rdp,
             rpc: false,
@@ -871,11 +913,21 @@ impl ViewerConfig {
     }
 
     pub fn into_config(self) -> anyhow::Result<Config> {
+        self.into_config_builder()?.build()
+    }
+
+    /// Resolves credentials and client identity, leaving native desktop dimensions to the caller.
+    pub fn into_config_builder(self) -> anyhow::Result<ConfigBuilder> {
         // When dumping, the built config is only used to observe the effective, secret-stripped
         // PropertySet; we never start a session. Secrets are stripped on `build()` anyway, so there
         // is no point prompting for them: fill a placeholder instead.
         let dump = self.dump_rdp.is_some();
         prompt_missing(self.builder, dump)
+    }
+
+    /// Returns the preferred local desktop windows, or none for RemoteApp and RPC mode.
+    pub fn desktop_options(&self) -> Option<&DesktopOptions> {
+        self.desktop.as_ref()
     }
 
     /// Path to the log file requested on the CLI, if any.
@@ -1131,7 +1183,7 @@ fn apply_cli_to_builder(
 /// When `dump` is set, the resulting config is only used to observe the effective, secret-stripped
 /// PropertySet (no session is started). Secret fields are stripped on `build()` regardless, so they
 /// are filled with a placeholder instead of being prompted for.
-fn prompt_missing(mut builder: ConfigBuilder, dump: bool) -> anyhow::Result<Config> {
+fn prompt_missing(mut builder: ConfigBuilder, dump: bool) -> anyhow::Result<ConfigBuilder> {
     // Stripped on `build()`, so any value works when only dumping the PropertySet.
     const DUMP_SECRET_PLACEHOLDER: &str = "<stripped>";
 
@@ -1189,7 +1241,7 @@ fn prompt_missing(mut builder: ConfigBuilder, dump: bool) -> anyhow::Result<Conf
         };
     }
 
-    builder.build()
+    Ok(builder)
 }
 
 fn client_build() -> u32 {
