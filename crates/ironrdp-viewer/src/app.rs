@@ -26,6 +26,7 @@ use winit::window::{Cursor, CursorIcon, CustomCursor, Window, WindowAttributes};
 
 use crate::desktop::MonitorWindows;
 use crate::keymap::{is_modifier, map_key_code};
+use crate::monitor::MonitorFocusState;
 use crate::rail::{RailWindows, bounded_window_size, window_point_to_desktop};
 
 /// Emulated mouse operations kept while the session input queue is full; beyond this, moves are dropped.
@@ -96,6 +97,7 @@ pub struct RpcApp {
     /// Whether releasing every held key and button after a focus loss waits for room in the
     /// session input queue.
     release_pending: bool,
+    monitor_focus: MonitorFocusState,
 }
 
 impl App {
@@ -190,6 +192,7 @@ impl RpcApp {
             rail_windows: RailWindows::default(),
             pending_rail_inputs: std::collections::VecDeque::new(),
             release_pending: false,
+            monitor_focus: MonitorFocusState::default(),
         }
     }
 
@@ -457,6 +460,17 @@ impl RpcApp {
         sb_buffer.present().expect("buffer present");
     }
     fn on_about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // UNTESTED: internal monitor focus transfers must preserve held buttons so dragging continues.
+        // Cancel delayed release on focus gain; verify cross-output dragging and Alt-Tab out of the viewer.
+        if self.monitor_focus.release_due(Instant::now())
+            && self
+                .monitor_windows
+                .as_ref()
+                .is_some_and(|monitors| !monitors.has_focus())
+        {
+            self.release_touch();
+            self.release_pending = true;
+        }
         self.send_pending_rail_input();
         self.send_touch_frames();
         self.send_touch_mouse();
@@ -468,7 +482,11 @@ impl RpcApp {
             || self.release_pending
             || !self.pending_rail_inputs.is_empty();
         let touch_retry = touch_pending.then(|| Instant::now() + Duration::from_millis(10));
-        let deadline = touch_retry.into_iter().chain(self.resize_deadline()).min();
+        let deadline = touch_retry
+            .into_iter()
+            .chain(self.resize_deadline())
+            .chain(self.monitor_focus.deadline())
+            .min();
         event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 
@@ -768,11 +786,7 @@ impl RpcApp {
                     window.request_redraw();
                 }
             }
-            WindowEvent::Focused(false) => {
-                self.release_touch();
-                self.release_pending = true;
-                self.send_pending_rail_input();
-            }
+            WindowEvent::Focused(focused) => self.monitor_focus.set_focused(Instant::now(), focused),
             WindowEvent::Touch(touch) => {
                 self.send_pending_rail_input();
                 if let Some(position) = self

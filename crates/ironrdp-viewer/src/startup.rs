@@ -96,6 +96,9 @@ impl<'a> WindowedApp<'a> {
             .windows
             .native_sizes()
             .context("native windows are not drawable")?;
+        if desktop.options.fullscreen {
+            desktop.windows.capture_output_geometries()?;
+        }
         let layout = match desktop.options.monitor_layout {
             MonitorLayoutMode::Local => desktop.windows.local_layout()?,
             MonitorLayoutMode::Horizontal => desktop.options.layout.fit_window_sizes(&sizes)?,
