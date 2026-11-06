@@ -110,7 +110,7 @@ pub enum DisplayResizeFallbackReason {
     DisplayControlUnavailable,
     /// The server did not send the required Display Control capabilities PDU in time.
     CapabilitiesTimedOut,
-    /// The server did not reactivate the session after a monitor-layout request in time.
+    /// The server did not apply the requested desktop size through reactivation or graphics reset in time.
     ReactivationTimedOut,
 }
 
@@ -1097,6 +1097,12 @@ struct TimedResizeRequest {
     deadline: tokio::time::Instant,
 }
 
+struct InFlightResize {
+    request: ResizeRequest,
+    deadline: tokio::time::Instant,
+    from_size: (u16, u16),
+}
+
 const DISPLAY_CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The largest virtual desktop width or height the GCC Client Monitor Data block may describe.
@@ -1104,7 +1110,7 @@ const MAX_VIRTUAL_DESKTOP_DIMENSION: u32 = 32_766;
 
 #[derive(Default)]
 struct ResizeQueue {
-    in_flight: Option<TimedResizeRequest>,
+    in_flight: Option<InFlightResize>,
     pending: Option<TimedResizeRequest>,
 }
 
@@ -1125,15 +1131,26 @@ impl ResizeQueue {
         });
     }
 
-    fn mark_in_flight(&mut self, request: ResizeRequest) {
-        self.in_flight = Some(TimedResizeRequest {
+    fn mark_in_flight(&mut self, request: ResizeRequest, from_size: (u16, u16)) {
+        self.in_flight = Some(InFlightResize {
             request,
             deadline: tokio::time::Instant::now() + DISPLAY_CONTROL_READY_TIMEOUT,
+            from_size,
         });
     }
 
-    fn completed(&mut self) {
+    fn completed(&mut self, desktop_size: (u16, u16)) -> bool {
+        let Some(in_flight) = self.in_flight.as_ref() else {
+            return false;
+        };
+        let requested_size = (in_flight.request.width, in_flight.request.height);
+        if desktop_size == in_flight.from_size && desktop_size != requested_size {
+            // An unrelated reset at the starting size must not cancel resize recovery.
+            return false;
+        }
+        // Accept an adjusted size too: reconnecting cannot force the server to honor the exact request.
         self.in_flight = None;
+        true
     }
 
     fn timed_out_request(&self, now: tokio::time::Instant) -> Option<(ResizeRequest, DisplayResizeFallbackReason)> {
@@ -4903,7 +4920,7 @@ async fn active_session(
                                 }
                                 dvc_batch => {
                                     let (width, height) = (request.width, request.height);
-                                    resize_queue.mark_in_flight(request);
+                                    resize_queue.mark_in_flight(request, (image.width(), image.height()));
                                     let mut outputs = Vec::new();
                                     if let Some(messages) = active_stage
                                         .get_svc_processor_mut::<RailClient>()
@@ -5324,6 +5341,17 @@ async fn active_session(
                 }
             }
         };
+
+        // MS-RDPEDISP 1.3 uses a graphics pipeline restart instead of reactivation with EGFX.
+        if let Some(output_size) = active_stage.take_graphics_output_reset()
+            && resize_queue.completed(output_size)
+        {
+            debug!(
+                width = output_size.0,
+                height = output_size.1,
+                "Graphics pipeline output reset completed the resize"
+            );
+        }
 
         #[cfg(feature = "telemetry")]
         {
@@ -5746,7 +5774,7 @@ async fn active_session(
                             debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
                             image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
                             desktop_update_extent = None;
-                            resize_queue.completed();
+                            resize_queue.completed((desktop_size.width, desktop_size.height));
                             if !active_stage.reactivate(
                                 connection_activation.io_channel_id(),
                                 connection_activation.user_channel_id(),
@@ -6047,7 +6075,7 @@ async fn active_session(
                         batch => batch?,
                     };
                     resize_queue.pending = None;
-                    resize_queue.mark_in_flight(request);
+                    resize_queue.mark_in_flight(request, (image.width(), image.height()));
                     let channel_id = batch.channel_id();
                     let messages = batch.into_messages();
                     #[cfg(feature = "udp")]
@@ -6653,12 +6681,13 @@ mod tests {
         );
     }
 
+    // oracle: regression Devolutions/IronRDP#2014 (keep the latest request until resize completion)
     #[test]
-    fn resize_queue_coalesces_later_requests_until_reactivation() {
+    fn resize_queue_coalesces_later_requests_until_completion() {
         let first = resize_request(1024, 768);
         let latest = resize_request(1600, 900);
         let mut queue = ResizeQueue::default();
-        queue.mark_in_flight(first);
+        queue.mark_in_flight(first, (800, 600));
         let deadline = queue.deadline().expect("in-flight resize must have a deadline");
         queue.defer(latest.clone());
 
@@ -6666,7 +6695,7 @@ mod tests {
             queue.timed_out_request(deadline),
             Some((latest.clone(), DisplayResizeFallbackReason::ReactivationTimedOut))
         );
-        queue.completed();
+        queue.completed((1024, 768));
         assert!(queue.in_flight.is_none());
         assert_eq!(
             queue.pending.as_ref().map(|pending| pending.request.clone()),

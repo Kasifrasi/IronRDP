@@ -10,8 +10,125 @@ use std::sync::Arc;
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
-use ironrdp_session::composite_graphics_updates;
 use ironrdp_session::image::DecodedImage;
+use ironrdp_session::{ActiveStage, composite_graphics_updates};
+
+// oracle: mutant missed, duplicate or size-only graphics output reset notifications
+#[rstest::rstest]
+#[case::tcp(deliver_tcp_graphics_reset)]
+#[case::reliable_udp(deliver_udp_graphics_reset)]
+fn output_resets_are_reported_without_a_completed_frame(
+    #[case] deliver: fn(&mut ActiveStage, &mut DecodedImage, &[u8]),
+) {
+    use ironrdp_core::encode_vec;
+    use ironrdp_dvc::DrdynvcClient;
+    use ironrdp_dvc::pdu::{CreateRequestPdu, DataPdu, DrdynvcDataPdu, DrdynvcServerPdu};
+    use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+    use ironrdp_egfx::pdu::{GfxPdu, ResetGraphicsPdu};
+    use ironrdp_graphics::zgfx::wrap_uncompressed;
+    use ironrdp_session::ActiveStageBuilder;
+    use ironrdp_svc::{StaticChannelSet, SvcProcessor as _};
+
+    struct Handler;
+    impl GraphicsPipelineHandler for Handler {}
+
+    let mut drdynvc = DrdynvcClient::new().with_dynamic_channel(GraphicsPipelineClient::new(Box::new(Handler), None));
+    drdynvc
+        .process(
+            &encode_vec(&DrdynvcServerPdu::Create(CreateRequestPdu::new(
+                1,
+                ironrdp_egfx::CHANNEL_NAME.to_owned(),
+            )))
+            .unwrap(),
+        )
+        .unwrap();
+    let mut channels = StaticChannelSet::new();
+    channels.insert(drdynvc);
+    channels.attach_channel_id(core::any::TypeId::of::<DrdynvcClient>(), 1004);
+    let mut stage = ActiveStageBuilder {
+        static_channels: channels,
+        user_channel_id: 1001,
+        io_channel_id: 1003,
+        message_channel_id: None,
+        share_id: 1,
+        compression_type: None,
+        enable_server_pointer: false,
+        pointer_software_rendering: false,
+    }
+    .build();
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 800, 600);
+    assert_eq!(stage.take_graphics_output_reset(), None);
+
+    for (width, height) in [(800, 600), (1024, 768), (1024, 768)] {
+        let reset = encode_vec(&GfxPdu::ResetGraphics(ResetGraphicsPdu {
+            width: u32::from(width),
+            height: u32::from(height),
+            monitors: Vec::new(),
+        }))
+        .unwrap();
+        let data = encode_vec(&DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
+            1,
+            wrap_uncompressed(&reset),
+        ))))
+        .unwrap();
+        deliver(&mut stage, &mut image, &data);
+        // oracle: spec MS-RDPEGFX v19.0 §3.3.5.14 (ResetGraphics resizes the output buffer)
+        assert_eq!((image.width(), image.height()), (width, height));
+        assert_eq!(stage.take_graphics_output_reset(), Some((width, height)));
+        assert_eq!(stage.take_graphics_output_reset(), None);
+
+        deliver(&mut stage, &mut image, &data);
+        assert!(stage.reactivate(1003, 1001, 1, false, false, 1600));
+        assert_eq!(stage.take_graphics_output_reset(), None);
+    }
+}
+
+fn deliver_tcp_graphics_reset(stage: &mut ActiveStage, image: &mut DecodedImage, data: &[u8]) {
+    use std::borrow::Cow;
+
+    use ironrdp_core::encode_vec;
+    use ironrdp_pdu::Action;
+    use ironrdp_pdu::mcs::SendDataIndication;
+    use ironrdp_pdu::rdp::vc::{ChannelControlFlags, ChannelPduHeader};
+    use ironrdp_pdu::x224::X224;
+
+    let mut user_data = encode_vec(&ChannelPduHeader {
+        length: u32::try_from(data.len()).unwrap(),
+        flags: ChannelControlFlags::FLAG_FIRST | ChannelControlFlags::FLAG_LAST,
+    })
+    .unwrap();
+    user_data.extend_from_slice(data);
+    let frame = encode_vec(&X224(SendDataIndication {
+        initiator_id: 1001,
+        channel_id: 1004,
+        user_data: Cow::Owned(user_data),
+    }))
+    .unwrap();
+    stage.process(image, Action::X224, &frame, None).unwrap();
+}
+
+fn deliver_udp_graphics_reset(stage: &mut ActiveStage, image: &mut DecodedImage, data: &[u8]) {
+    use ironrdp_core::encode_vec;
+    use ironrdp_dvc::DrdynvcClient;
+    use ironrdp_dvc::pdu::{DrdynvcServerPdu, SoftSyncChannelList, SoftSyncRequestPdu, SoftSyncTunnelType};
+    use ironrdp_svc::SvcProcessor as _;
+
+    if !stage.reliable_udp_dvc_tunnel_in_use() {
+        stage.enable_reliable_udp_dvc_tunnel().unwrap();
+        let soft_sync = encode_vec(&DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::new(vec![
+            SoftSyncChannelList::new(SoftSyncTunnelType::RELIABLE_UDP, vec![1]),
+        ])))
+        .unwrap();
+        stage
+            .get_svc_processor_mut::<DrdynvcClient>()
+            .unwrap()
+            .process(&soft_sync)
+            .unwrap();
+    }
+    stage
+        .process_dvc_tunnel(image, SoftSyncTunnelType::RELIABLE_UDP, data)
+        .unwrap();
+}
 
 fn update(left: u16, top: u16, right: u16, bottom: u16) -> (ExclusiveRectangle, Vec<u8>) {
     let w = usize::from(right - left);
