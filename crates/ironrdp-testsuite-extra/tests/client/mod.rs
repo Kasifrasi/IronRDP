@@ -12,5 +12,5 @@ mod rail;
 mod remote_guard;
 mod resize;
 mod telemetry;
-mod viewer_rail;
 mod viewer_monitor;
+mod viewer_rail;
