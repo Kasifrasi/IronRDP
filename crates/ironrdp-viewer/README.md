@@ -66,7 +66,12 @@ ironrdp-viewer <HOSTNAME> --username <USERNAME> --monitors DP-1,HDMI-A-1 --fulls
 Before connecting, every window must report fullscreen on its selected output and present at its current native size.
 If an output disappears or the windows do not become ready within ten seconds, startup ends with an error before connecting.
 Other window-system backends reject `--fullscreen` because winit can report requested state before fullscreen is applied.
-The remote monitor row still follows the selection order; local vertical offsets are not imported.
+Fullscreen uses the local output arrangement by default, reconstructed from logical neighbors and the native window sizes.
+The selected primary changes the coordinate origin without rearranging the outputs.
+With mixed display scales, native monitor resolutions are preserved, so relative sizes, edge alignment and pointer coordinates can differ from the logical desktop.
+Overlapping, disconnected or otherwise invalid native layouts are rejected before connecting.
+Use `--monitor-layout horizontal` for a horizontal remote row in selection order.
+The local layout is captured at startup; automatic updates for output changes are not enabled.
 Use the compositor's close-window action to close the fullscreen session.
 
 On Windows, the viewer redirects local drives:

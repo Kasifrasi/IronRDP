@@ -95,6 +95,15 @@ impl KeyboardType {
     }
 }
 
+/// Arrangement of the selected fullscreen remote monitors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MonitorLayoutMode {
+    /// Reconstruct local output neighbors and offsets at native resolutions.
+    Local,
+    /// Arrange remote monitors in a horizontal row in selection order.
+    Horizontal,
+}
+
 /// Devolutions IronRDP viewer
 #[derive(Parser, Debug)]
 #[clap(author = "Devolutions", about = "Devolutions-IronRDP viewer")]
@@ -249,6 +258,10 @@ struct Args {
     /// Fails before connecting if fullscreen on the selected outputs is not confirmed.
     #[clap(long, requires = "monitors")]
     fullscreen: bool,
+
+    /// Fullscreen monitor arrangement; defaults to local output geometry.
+    #[clap(long, value_enum, requires = "fullscreen")]
+    monitor_layout: Option<MonitorLayoutMode>,
 
     /// Set required color depth. Currently only 32 and 16 bit color depths are supported
     #[clap(long)]
@@ -662,6 +675,7 @@ pub struct DesktopOptions {
     pub scale_factor: Option<u32>,
     pub selection: Option<crate::outputs::MonitorSelection>,
     pub fullscreen: bool,
+    pub monitor_layout: MonitorLayoutMode,
 }
 
 impl ViewerConfig {
@@ -900,6 +914,11 @@ impl ViewerConfig {
                     ),
                 }),
                 fullscreen: args.fullscreen,
+                monitor_layout: args.monitor_layout.unwrap_or(if args.fullscreen {
+                    MonitorLayoutMode::Local
+                } else {
+                    MonitorLayoutMode::Horizontal
+                }),
             })
         };
 
