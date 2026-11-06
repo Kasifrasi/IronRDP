@@ -1477,6 +1477,61 @@ fn monitor_layout_is_preserved_in_connector_configuration() {
     assert_eq!(config.connector().monitor_layout.as_ref(), Some(&monitor_layout));
 }
 
+// oracle: user request, one connection with three adjacent virtual monitors
+#[test]
+fn viewer_monitor_count_builds_one_virtual_desktop() {
+    let config = parse_config_from_rdp(
+        "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\n",
+        &[
+            "--monitor-count",
+            "3",
+            "--desktop-width",
+            "1280",
+            "--desktop-height",
+            "800",
+        ],
+    );
+    assert_eq!(config.connector().desktop_size.width, 3840);
+    assert_eq!(config.connector().desktop_size.height, 800);
+    assert_eq!(
+        config.connector().monitor_layout.as_ref().unwrap().monitors,
+        vec![
+            Monitor {
+                left: 0,
+                top: 0,
+                right: 1279,
+                bottom: 799,
+                flags: MonitorFlags::PRIMARY
+            },
+            Monitor {
+                left: 1280,
+                top: 0,
+                right: 2559,
+                bottom: 799,
+                flags: MonitorFlags::empty()
+            },
+            Monitor {
+                left: 2560,
+                top: 0,
+                right: 3839,
+                bottom: 799,
+                flags: MonitorFlags::empty()
+            },
+        ]
+    );
+}
+
+// oracle: viewer CLI, fixed virtual monitors need explicit dimensions and direct desktop mode
+#[rstest::rstest]
+#[case::missing_dimensions(&["--monitor-count", "3"])]
+#[case::too_many_monitors(&["--monitor-count", "17", "--desktop-width", "1280", "--desktop-height", "800"])]
+#[case::oversized_desktop(&["--monitor-count", "8", "--desktop-width", "8192", "--desktop-height", "800"])]
+#[case::rpc(&["--rpc", "--monitor-count", "3", "--desktop-width", "1280", "--desktop-height", "800"])]
+#[case::remote_app(&["--remote-app", "||app", "--monitor-count", "3", "--desktop-width", "1280", "--desktop-height", "800"])]
+fn viewer_monitor_count_rejects_incompatible_arguments(#[case] extra: &[&str]) {
+    assert!(ViewerConfig::parse_from(core::iter::once("ironrdp-viewer").chain(extra.iter().copied())).is_err());
+}
+
 #[test]
 fn with_audio_mode_redirect_enables_playback_channel() {
     use ironrdp_cfg::AudioMode;
