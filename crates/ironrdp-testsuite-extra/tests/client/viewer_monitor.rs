@@ -4,7 +4,179 @@ use ironrdp::client::rdp::DesktopUpdate;
 use ironrdp::input::MousePosition;
 use ironrdp::pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp::pdu::geometry::InclusiveRectangle;
-use ironrdp_viewer::monitor::{DesktopFrame, MonitorLayout, MonitorViewport};
+use ironrdp_viewer::monitor::{DesktopFrame, MonitorLayout, MonitorResizeState, MonitorViewport};
+
+// oracle: fallback must not infer monitor topology from framebuffer dimensions alone
+#[test]
+fn fallback_clears_resize_intent_until_a_matching_layout_is_confirmed() {
+    let layout = MonitorLayout::new(&[monitor(0, 0, 1279, 799, true), monitor(1280, 0, 2559, 799, false)]).unwrap();
+    let mut state = MonitorResizeState::new(100);
+    state.set_layout(&layout);
+    state.resized(0, (1888, 1004)).unwrap();
+    state.observe_frame(layout.size());
+    assert!(state.resized(0, (1400, 900)).unwrap());
+    state.observe_frame((2000, 900));
+    assert!(state.pending().is_none());
+    assert!(!state.resized(0, (1600, 900)).unwrap());
+    state.observe_frame(layout.size());
+    assert!(!state.resized(0, (1800, 900)).unwrap());
+    state.set_layout(&layout);
+    state.observe_frame(layout.size());
+    assert!(state.resized(0, (2000, 900)).unwrap());
+}
+
+// oracle: MonitorLayoutRejected keeps the applied layout; newer unsent changes remain local intent
+#[test]
+fn rejected_layout_preserves_only_newer_unsent_monitor_changes() {
+    let layout = MonitorLayout::new(&[monitor(0, 0, 1279, 799, true), monitor(1280, 0, 2559, 799, false)]).unwrap();
+    let mut state = MonitorResizeState::new(100);
+    state.set_layout(&layout);
+    state.resized(0, (1888, 1004)).unwrap();
+    state.resized(1, (1888, 1004)).unwrap();
+    state.observe_frame(layout.size());
+    state.resized(0, (1400, 1004)).unwrap();
+    state.submitted();
+    state.resized(1, (1600, 900)).unwrap();
+    state.rejected().unwrap();
+    let request = state.pending().unwrap();
+    assert_eq!(request.monitors()[0].dimensions(), (1280, 800));
+    assert_eq!(request.monitors()[1].dimensions(), (1600, 900));
+    assert_eq!(request.monitors()[1].position(), Some((1280, 0)));
+}
+
+// oracle: resizing one monitor must preserve all untouched monitor resolutions
+#[test]
+fn odd_sibling_size_is_preserved_instead_of_silently_shrunk() {
+    let layout = MonitorLayout::new(&[monitor(0, 0, 1280, 799, true), monitor(1281, 0, 2561, 799, false)]).unwrap();
+    let resized = layout.resize_horizontal(0, (1400, 800)).unwrap();
+    assert_eq!(resized.monitors()[1].width, 1281);
+    assert!(resized.to_display_control(100).is_err());
+}
+
+// oracle: signed primary-relative monitor coordinates and the requested horizontal resize behavior
+#[test]
+fn resizing_a_monitor_left_of_primary_keeps_primary_at_zero() {
+    let layout = MonitorLayout::new(&[
+        monitor(0, 0, 1279, 799, true),
+        monitor(-1280, 0, -1, 799, false),
+        monitor(1280, 0, 2559, 799, false),
+    ])
+    .unwrap();
+    let request = layout
+        .resize_horizontal(1, (1000, 800))
+        .unwrap()
+        .to_display_control(100)
+        .unwrap();
+    assert_eq!(
+        request
+            .monitors()
+            .iter()
+            .map(|entry| entry.position())
+            .collect::<Vec<_>>(),
+        vec![Some((0, 0)), Some((-1000, 0)), Some((1280, 0))]
+    );
+    assert_eq!(request.desktop_size(), (3560, 800));
+}
+
+// oracle: a later monitor resize must not discard a preceding request when the server repeats the old layout
+#[test]
+fn resize_intent_survives_old_layouts_and_coalesces_across_monitors() {
+    let layout = MonitorLayout::new(&[monitor(0, 0, 1279, 799, true), monitor(1280, 0, 2559, 799, false)]).unwrap();
+    let mut state = MonitorResizeState::new(100);
+    state.set_layout(&layout);
+    assert!(!state.resized(0, (1888, 1004)).unwrap());
+    assert!(!state.resized(1, (1888, 1004)).unwrap());
+    state.observe_frame(layout.size());
+    assert!(state.resized(0, (1400, 1004)).unwrap());
+    state.submitted();
+    state.set_layout(&layout);
+    assert!(state.resized(1, (1600, 900)).unwrap());
+    let request = state.pending().unwrap();
+    assert_eq!(request.monitors()[0].dimensions(), (1400, 1004));
+    assert_eq!(request.monitors()[1].dimensions(), (1600, 900));
+    assert_eq!(request.monitors()[1].position(), Some((1400, 0)));
+    state.submitted();
+    assert!(!state.resized(1, (1601, 900)).unwrap());
+    assert!(state.pending().is_none());
+}
+
+// oracle: compositor-created windows must not request another startup layout even after an early desktop frame
+#[test]
+fn first_native_sizes_after_a_frame_remain_local_configuration() {
+    let layout = MonitorLayout::new(&[monitor(0, 0, 1279, 799, true), monitor(1280, 0, 2559, 799, false)]).unwrap();
+    let mut state = MonitorResizeState::new(100);
+    state.set_layout(&layout);
+    state.observe_frame(layout.size());
+    assert!(!state.resized(0, (1888, 1004)).unwrap());
+    assert!(!state.resized(1, (1888, 1004)).unwrap());
+    assert!(state.pending().is_none());
+}
+
+// oracle: dynamic requests currently support the horizontal virtual layout selected by --monitor-count
+#[test]
+fn resizing_a_vertical_server_layout_keeps_local_scaling() {
+    let layout = MonitorLayout::new(&[monitor(0, 0, 1279, 799, true), monitor(0, 800, 1279, 1599, false)]).unwrap();
+    assert!(layout.resize_horizontal(0, (1400, 800)).is_err());
+}
+
+// oracle: the existing viewer/compositor framebuffer limit is 256 MiB
+#[test]
+fn resizing_a_monitor_cannot_exceed_the_framebuffer_budget() {
+    let layout = MonitorLayout::new(&[
+        monitor(0, 0, 1279, 799, true),
+        monitor(1280, 0, 2559, 799, false),
+        monitor(2560, 0, 3839, 799, false),
+    ])
+    .unwrap();
+    assert!(layout.resize_horizontal(0, (8192, 8192)).is_err());
+}
+
+// oracle: requested behavior and startup trace, initial compositor sizing must not trigger a remote resize
+#[test]
+fn initial_window_sizing_waits_for_a_later_local_resize() {
+    let layout = MonitorLayout::new(&[monitor(0, 0, 1279, 799, true), monitor(1280, 0, 2559, 799, false)]).unwrap();
+    let mut state = MonitorResizeState::new(100);
+    assert!(!state.resized(0, (1888, 1004)).unwrap());
+    state.set_layout(&layout);
+    state.observe_frame(layout.size());
+    assert!(state.resized(0, (1400, 1004)).unwrap());
+    let request = state.pending().unwrap();
+    assert_eq!(request.monitors()[0].dimensions(), (1400, 1004));
+    assert_eq!(request.monitors()[1].dimensions(), (1280, 800));
+    assert_eq!(request.monitors()[1].position(), Some((1400, 0)));
+}
+
+// oracle: requested behavior, resizing one horizontal monitor preserves its siblings and their adjacency
+#[test]
+fn resizing_one_monitor_updates_the_complete_horizontal_layout() {
+    let layout = MonitorLayout::new(&[
+        monitor(0, 0, 1279, 799, true),
+        monitor(1280, 0, 2559, 799, false),
+        monitor(2560, 0, 3839, 799, false),
+    ])
+    .unwrap();
+    let resized = layout.resize_horizontal(1, (1401, 900)).unwrap();
+    let request = resized.to_display_control(150).unwrap();
+    assert_eq!(resized.size(), (3960, 900));
+    assert_eq!(request.desktop_size(), (3960, 900));
+    assert_eq!(
+        request
+            .monitors()
+            .iter()
+            .map(|entry| (
+                entry.is_primary(),
+                entry.position(),
+                entry.dimensions(),
+                entry.desktop_scale_factor()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (true, Some((0, 0)), (1280, 800), Some(150)),
+            (false, Some((1280, 0)), (1400, 900), Some(150)),
+            (false, Some((2680, 0)), (1280, 800), Some(150)),
+        ]
+    );
+}
 
 // oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (inclusive coordinates relative to the primary monitor)
 #[test]
