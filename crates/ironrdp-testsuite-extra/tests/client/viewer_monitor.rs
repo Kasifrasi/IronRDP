@@ -4,7 +4,137 @@ use ironrdp::client::rdp::DesktopUpdate;
 use ironrdp::input::MousePosition;
 use ironrdp::pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp::pdu::geometry::InclusiveRectangle;
-use ironrdp_viewer::monitor::{DesktopFrame, MonitorLayout, MonitorResizeState, MonitorViewport};
+use ironrdp_viewer::monitor::{DesktopFrame, MonitorLayout, MonitorResizeState, MonitorViewport, OutputGeometry};
+
+// oracle: reference captured Wayland output layout; HDMI and DP are adjacent, and the laptop starts 120 logical pixels lower.
+#[test]
+fn local_layout_preserves_offsets_and_native_mixed_scale_resolutions() {
+    let outputs = [
+        OutputGeometry {
+            position: (0, 0),
+            logical_size: (1920, 1080),
+            native_size: (1920, 1080),
+        },
+        OutputGeometry {
+            position: (1920, 0),
+            logical_size: (1920, 1080),
+            native_size: (1920, 1080),
+        },
+        OutputGeometry {
+            position: (3840, 120),
+            logical_size: (1536, 960),
+            native_size: (1920, 1200),
+        },
+    ];
+    let layout = MonitorLayout::from_local_outputs(&outputs, 0).unwrap();
+    assert_eq!(layout.size(), (5760, 1320));
+    assert_eq!(
+        layout.to_client_monitor_data().unwrap().monitors,
+        vec![
+            monitor(0, 0, 1919, 1079, true),
+            monitor(1920, 0, 3839, 1079, false),
+            monitor(3840, 120, 5759, 1319, false),
+        ]
+    );
+}
+
+// oracle: reference captured Wayland output layout translated to the laptop origin; changing primary does not move a physical output.
+#[test]
+fn local_layout_is_independent_of_selection_order_and_primary() {
+    let outputs = [
+        output((3840, 120), (1536, 960), (1920, 1200)),
+        output((0, 0), (1920, 1080), (1920, 1080)),
+        output((1920, 0), (1920, 1080), (1920, 1080)),
+    ];
+    let layout = MonitorLayout::from_local_outputs(&outputs, 0).unwrap();
+    assert_eq!(layout.size(), (5760, 1320));
+    assert_eq!(
+        layout.to_client_monitor_data().unwrap().monitors,
+        vec![
+            monitor(0, 0, 1919, 1199, true),
+            monitor(-3840, -120, -1921, 959, false),
+            monitor(-1920, -120, -1, 959, false),
+        ]
+    );
+}
+
+// oracle: reference uniform scale 2 model doubles the logical cross-axis offset of 400 and the 1000-pixel vertical edge.
+#[test]
+fn local_layout_supports_vertical_neighbors_and_negative_coordinates() {
+    let outputs = [
+        output((-600, -1000), (1200, 1000), (2400, 2000)),
+        output((-200, 0), (800, 600), (1600, 1200)),
+    ];
+    let layout = MonitorLayout::from_local_outputs(&outputs, 1).unwrap();
+    assert_eq!(layout.size(), (2400, 3200));
+    assert_eq!(
+        layout.to_client_monitor_data().unwrap().monitors,
+        vec![monitor(-800, -2000, 1599, -1, false), monitor(0, 0, 1599, 1199, true),]
+    );
+}
+
+// oracle: spec MS-RDPEDISP §3.1.5.2 permits monitors adjacent at a single point.
+#[test]
+fn local_layout_accepts_corner_neighbors() {
+    let outputs = [
+        output((0, 0), (800, 600), (800, 600)),
+        output((800, 600), (640, 480), (640, 480)),
+    ];
+    let layout = MonitorLayout::from_local_outputs(&outputs, 0).unwrap();
+    assert_eq!(
+        layout.to_client_monitor_data().unwrap().monitors,
+        vec![monitor(0, 0, 799, 599, true), monitor(800, 600, 1439, 1079, false),]
+    );
+}
+
+// oracle: spec MS-RDPEDISP §§3.1.5.2 and 2.2.2.2.1 require nonoverlapping adjacent rectangles and supported dimensions.
+#[rstest::rstest]
+#[case::empty_logical(vec![output((0, 0), (0, 1080), (1920, 1080))])]
+#[case::odd_native_width(vec![output((0, 0), (1921, 1080), (1921, 1080))])]
+#[case::oversized_native(vec![output((0, 0), (9000, 1080), (9000, 1080))])]
+#[case::overlapping_logical(vec![
+    output((0, 0), (1920, 1080), (1920, 1080)),
+    output((100, 100), (1920, 1080), (1920, 1080)),
+])]
+#[case::disconnected(vec![
+    output((0, 0), (1920, 1080), (1920, 1080)),
+    output((4000, 0), (1920, 1080), (1920, 1080)),
+])]
+#[case::overlapping_native(vec![
+    output((0, 0), (1000, 1000), (1000, 1000)),
+    output((1000, 0), (1000, 1000), (2000, 2000)),
+    output((0, 1000), (1000, 1000), (1000, 1000)),
+    output((1000, 1000), (1000, 1000), (1000, 1000)),
+])]
+// oracle: reference connected native desktop model; these logical neighbors would become two separated native pairs.
+#[case::disconnected_native(vec![
+    output((0, 0), (1000, 1000), (2000, 2000)),
+    output((0, 1000), (1000, 1000), (2000, 2000)),
+    output((1000, -800), (1000, 1000), (1000, 1000)),
+    output((1000, -1800), (1000, 1000), (1000, 1000)),
+])]
+fn local_layout_rejects_invalid_geometry(#[case] outputs: Vec<OutputGeometry>) {
+    assert!(MonitorLayout::from_local_outputs(&outputs, 0).is_err());
+}
+
+// oracle: reference advertised-rectangle identity model, independent of the server's array order.
+#[test]
+fn local_layout_restores_window_order_from_server_rectangles() {
+    let expected = MonitorLayout::new(&[
+        monitor(3840, 120, 5759, 1319, false),
+        monitor(0, 0, 1919, 1079, true),
+        monitor(1920, 0, 3839, 1079, false),
+    ])
+    .unwrap();
+    let mut reported = MonitorLayout::new(&[
+        monitor(0, 0, 1919, 1079, true),
+        monitor(1920, 0, 3839, 1079, false),
+        monitor(3840, 120, 5759, 1319, false),
+    ])
+    .unwrap();
+    assert!(reported.reorder_to_match(&expected));
+    assert_eq!(reported, expected);
+}
 
 // oracle: reference horizontal native-window model; 1888 + 1400 + 1600 = 4888 pixels wide, 1004 pixels high.
 #[test]
@@ -480,5 +610,13 @@ fn monitor(left: i32, top: i32, right: i32, bottom: i32, primary: bool) -> Monit
         } else {
             MonitorFlags::empty()
         },
+    }
+}
+
+fn output(position: (i32, i32), logical_size: (u32, u32), native_size: (u32, u32)) -> OutputGeometry {
+    OutputGeometry {
+        position,
+        logical_size,
+        native_size,
     }
 }
