@@ -33,6 +33,7 @@ pub(crate) struct MonitorWindows {
     windows: Vec<DesktopWindow>,
     preferred_primary: MonitorId,
     outputs: Vec<SelectedOutput>,
+    output_geometries: Vec<OutputGeometry>,
     fullscreen: bool,
     layout_mode: MonitorLayoutMode,
     requested_layout: Option<MonitorLayout>,
@@ -70,8 +71,8 @@ impl MonitorWindows {
         self.layout = Some(layout);
     }
 
-    pub(crate) fn local_layout(&self) -> anyhow::Result<MonitorLayout> {
-        let geometries = self.outputs.iter().enumerate().map(|(index, output)| {
+    pub(crate) fn capture_output_geometries(&mut self) -> anyhow::Result<()> {
+        self.output_geometries = self.outputs.iter().enumerate().map(|(index, output)| {
             let view = self.windows.iter().find(|view| view.monitor_id == MonitorId(index))
                 .context("selected output has no monitor window")?;
             let scale = view.window.scale_factor();
@@ -92,7 +93,11 @@ impl MonitorWindows {
                 native_size: (native.width, native.height),
             })
         }).collect::<anyhow::Result<Vec<_>>>()?;
-        MonitorLayout::from_local_outputs(&geometries, self.preferred_primary.0)
+        Ok(())
+    }
+
+    pub(crate) fn local_layout(&self) -> anyhow::Result<MonitorLayout> {
+        MonitorLayout::from_local_outputs(&self.output_geometries, self.preferred_primary.0)
     }
 
     pub(crate) fn native_sizes(&self) -> Option<Vec<(u32, u32)>> {
@@ -164,6 +169,7 @@ impl MonitorWindows {
             windows: Vec::new(),
             preferred_primary: MonitorId(0),
             outputs: Vec::new(),
+            output_geometries: Vec::new(),
             fullscreen: false,
             layout_mode: MonitorLayoutMode::Horizontal,
             requested_layout: None,
@@ -187,9 +193,26 @@ impl MonitorWindows {
     pub(crate) fn position(&self, id: WindowId, local: PhysicalPosition<f64>) -> Option<ironrdp::input::MousePosition> {
         let view = self.windows.iter().find(|view| view.window.id() == id)?;
         let size = view.window.inner_size();
+        if self.fullscreen
+            && self.windows.len() == self.output_geometries.len()
+            && let Some(layout) = &self.layout
+        {
+            // UNTESTED: Wayland keeps delivering drag motion to the pressed surface outside its bounds.
+            // Preserve that motion across outputs; verify dragging in both directions at mixed scales.
+            return layout.position_on_outputs(
+                &self.output_geometries,
+                view.remote_index,
+                (size.width, size.height),
+                (local.x, local.y),
+            );
+        }
         view.viewport
             .as_ref()?
             .position((size.width, size.height), (local.x, local.y))
+    }
+
+    pub(crate) fn has_focus(&self) -> bool {
+        self.windows.iter().any(|view| view.window.has_focus())
     }
 
     pub(crate) fn frame_size(&self) -> (u16, u16) {

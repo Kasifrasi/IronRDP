@@ -1,5 +1,8 @@
 //! Monitor rectangles in the shared desktop framebuffer.
 
+use core::time::Duration;
+use std::time::Instant;
+
 use ironrdp::client::rdp::DesktopUpdate;
 use ironrdp::displaycontrol::pdu::{DeviceScaleFactor, DisplayControlMonitorLayout, MonitorLayoutEntry};
 use ironrdp::input::MousePosition;
@@ -7,6 +10,32 @@ use ironrdp::pdu::gcc::{ClientMonitorData, MONITOR_COUNT_MAX, Monitor, MonitorFl
 
 /// Maximum memory retained for a shared desktop, matching the graphics compositor's limit.
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
+/// Defers input release briefly so focus can transfer between monitor windows.
+#[derive(Default)]
+pub struct MonitorFocusState {
+    deadline: Option<Instant>,
+}
+
+impl MonitorFocusState {
+    pub fn set_focused(&mut self, now: Instant, focused: bool) {
+        // Focus loss and gain can arrive in separate dispatches; keep external release bounded.
+        self.deadline = (!focused).then_some(now + Duration::from_millis(100));
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub fn release_due(&mut self, now: Instant) -> bool {
+        if self.deadline.is_some_and(|deadline| deadline <= now) {
+            self.deadline = None;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// A monitor's rectangle relative to the framebuffer's top-left corner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +179,63 @@ impl OutputGeometry {
 }
 
 impl MonitorLayout {
+    /// Maps a fullscreen pointer through logical outputs into the corresponding remote monitor.
+    /// Positions outside the selected outputs clamp to the nearest selected output.
+    pub fn position_on_outputs(
+        &self,
+        outputs: &[OutputGeometry],
+        source: usize,
+        window_size: (u32, u32),
+        local: (f64, f64),
+    ) -> Option<MousePosition> {
+        if outputs.len() != self.monitors.len()
+            || window_size.0 == 0
+            || window_size.1 == 0
+            || !local.0.is_finite()
+            || !local.1.is_finite()
+        {
+            return None;
+        }
+        let origin = outputs.get(source)?;
+        let position = (
+            f64::from(origin.position.0) + local.0 / f64::from(window_size.0) * f64::from(origin.logical_size.0),
+            f64::from(origin.position.1) + local.1 / f64::from(window_size.1) * f64::from(origin.logical_size.1),
+        );
+        if !position.0.is_finite() || !position.1.is_finite() {
+            return None;
+        }
+        let mut nearest = None;
+        let mut distance = f64::INFINITY;
+        for (index, output) in outputs.iter().enumerate() {
+            if output.logical_size.0 == 0 || output.logical_size.1 == 0 {
+                return None;
+            }
+            let left = f64::from(output.position.0);
+            let top = f64::from(output.position.1);
+            let right = left + f64::from(output.logical_size.0);
+            let bottom = top + f64::from(output.logical_size.1);
+            if left <= position.0 && position.0 < right && top <= position.1 && position.1 < bottom {
+                nearest = Some(index);
+                break;
+            }
+            let candidate =
+                (position.0 - position.0.clamp(left, right)).hypot(position.1 - position.1.clamp(top, bottom));
+            if nearest.is_none() || candidate < distance {
+                nearest = Some(index);
+                distance = candidate;
+            }
+        }
+        let target = nearest?;
+        let output = &outputs[target];
+        self.monitors[target].position(
+            output.logical_size,
+            (
+                position.0 - f64::from(output.position.0),
+                position.1 - f64::from(output.position.1),
+            ),
+        )
+    }
+
     /// Reconstructs local output adjacency while preserving native remote resolutions.
     /// Output rectangles must form a connected, nonoverlapping logical layout.
     /// Native rectangles are placed through logical neighbors, so mixed scales can change edge alignment.

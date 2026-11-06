@@ -1,10 +1,156 @@
 use core::num::NonZeroU16;
+use core::time::Duration;
+use std::time::Instant;
 
 use ironrdp::client::rdp::DesktopUpdate;
 use ironrdp::input::MousePosition;
 use ironrdp::pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp::pdu::geometry::InclusiveRectangle;
-use ironrdp_viewer::monitor::{DesktopFrame, MonitorLayout, MonitorResizeState, MonitorViewport, OutputGeometry};
+use ironrdp_viewer::monitor::{
+    DesktopFrame, MonitorFocusState, MonitorLayout, MonitorResizeState, MonitorViewport, OutputGeometry,
+};
+
+// oracle: mutant releasing held input between focus loss and a later dispatch that focuses another monitor window.
+#[test]
+fn drag_survives_focus_transfer_in_separate_dispatches() {
+    let now = Instant::now();
+    let mut focus = MonitorFocusState::default();
+    focus.set_focused(now, false);
+    assert!(!focus.release_due(now));
+
+    focus.set_focused(now + Duration::from_millis(20), true);
+    assert!(!focus.release_due(now + Duration::from_secs(1)));
+    assert_eq!(focus.deadline(), None);
+}
+
+// oracle: mutant retaining held input indefinitely after focus leaves every monitor window.
+#[test]
+fn drag_releases_held_input_after_external_focus_loss() {
+    let now = Instant::now();
+    let mut focus = MonitorFocusState::default();
+    focus.set_focused(now, false);
+
+    assert!(!focus.release_due(now + Duration::from_millis(20)));
+    assert!(focus.release_due(now + Duration::from_secs(1)));
+    assert!(!focus.release_due(now + Duration::from_secs(2)));
+    assert_eq!(focus.deadline(), None);
+}
+
+// oracle: reference reversed local outputs with a horizontal remote row; logical x=1800 is x=3720 on remote monitor 1.
+#[test]
+fn drag_follows_local_outputs_when_the_remote_row_has_a_different_order() {
+    let outputs = [
+        output((1920, 0), (1920, 1080), (1920, 1080)),
+        output((0, 0), (1920, 1080), (1920, 1080)),
+    ];
+    let layout = MonitorLayout::new(&[monitor(0, 0, 1919, 1079, true), monitor(1920, 0, 3839, 1079, false)]).unwrap();
+
+    assert_eq!(
+        layout.position_on_outputs(&outputs, 0, (1920, 1080), (-120.0, 540.0)),
+        Some(MousePosition { x: 3720, y: 540 })
+    );
+}
+
+// oracle: reference two adjacent 1920-pixel outputs; a grabbed pointer 180 pixels past the first window is at desktop x=2100.
+#[test]
+fn drag_crosses_the_source_monitor_boundary() {
+    let outputs = [
+        output((0, 0), (1920, 1080), (1920, 1080)),
+        output((1920, 0), (1920, 1080), (1920, 1080)),
+    ];
+    let layout = MonitorLayout::from_local_outputs(&outputs, 0).unwrap();
+
+    assert_eq!(
+        layout.position_on_outputs(&outputs, 0, (1920, 1080), (2100.0, 540.0)),
+        Some(MousePosition { x: 2100, y: 540 })
+    );
+}
+
+// oracle: reference captured Wayland layout; laptop x=3840+(180*1.25), y=120+(480*1.25), regardless of the event's source window.
+#[rstest::rstest]
+#[case::external_to_laptop(1, (1920, 1080), (2100.0, 600.0), (4065, 720))]
+#[case::laptop_to_external(2, (1920, 1200), (-225.0, 600.0), (3660, 600))]
+#[case::laptop_own_window(2, (1920, 1200), (225.0, 600.0), (4065, 720))]
+#[case::laptop_left_edge(1, (1920, 1080), (1920.0, 600.0), (3840, 720))]
+fn drag_uses_the_destination_output_scale(
+    #[case] source: usize,
+    #[case] window_size: (u32, u32),
+    #[case] local: (f64, f64),
+    #[case] expected: (u16, u16),
+) {
+    let outputs = [
+        output((0, 0), (1920, 1080), (1920, 1080)),
+        output((1920, 0), (1920, 1080), (1920, 1080)),
+        output((3840, 120), (1536, 960), (1920, 1200)),
+    ];
+    let layout = MonitorLayout::from_local_outputs(&outputs, 2).unwrap();
+
+    assert_eq!(
+        layout.position_on_outputs(&outputs, source, window_size, local),
+        Some(MousePosition {
+            x: expected.0,
+            y: expected.1
+        })
+    );
+}
+
+// oracle: reference scale-2 desktop with negative logical origins; native top is (0,0) and native bottom is (800,2000).
+#[rstest::rstest]
+#[case::up(1, (1600, 1200), (200.0, -200.0), (1000, 1800))]
+#[case::down(0, (2400, 2000), (1000.0, 2200.0), (1000, 2200))]
+fn drag_crosses_vertical_monitor_boundaries(
+    #[case] source: usize,
+    #[case] window_size: (u32, u32),
+    #[case] local: (f64, f64),
+    #[case] expected: (u16, u16),
+) {
+    let outputs = [
+        output((-600, -1000), (1200, 1000), (2400, 2000)),
+        output((-200, 0), (800, 600), (1600, 1200)),
+    ];
+    let layout = MonitorLayout::from_local_outputs(&outputs, 1).unwrap();
+
+    assert_eq!(
+        layout.position_on_outputs(&outputs, source, window_size, local),
+        Some(MousePosition {
+            x: expected.0,
+            y: expected.1
+        })
+    );
+}
+
+// oracle: reference selected desktop boundaries; out-of-desktop input stays on the nearest selected output's last valid pixel.
+#[rstest::rstest]
+#[case::top_left((-100.0, -100.0), (0, 0))]
+#[case::bottom_right((6000.0, 1500.0), (5759, 1319))]
+fn drag_clamps_at_the_selected_desktop_edge(#[case] local: (f64, f64), #[case] expected: (u16, u16)) {
+    let outputs = [
+        output((0, 0), (1920, 1080), (1920, 1080)),
+        output((1920, 0), (1920, 1080), (1920, 1080)),
+        output((3840, 120), (1536, 960), (1920, 1200)),
+    ];
+    let layout = MonitorLayout::from_local_outputs(&outputs, 0).unwrap();
+
+    assert_eq!(
+        layout.position_on_outputs(&outputs, 0, (1920, 1080), local),
+        Some(MousePosition {
+            x: expected.0,
+            y: expected.1
+        })
+    );
+}
+
+// oracle: reference finite fullscreen-coordinate model; a missing source, zero content extent or NaN has no desktop position.
+#[rstest::rstest]
+#[case::missing_source(1, (1920, 1080), (1.0, 1.0))]
+#[case::minimized(0, (0, 1080), (1.0, 1.0))]
+#[case::nan(0, (1920, 1080), (f64::NAN, 1.0))]
+fn drag_rejects_unmappable_input(#[case] source: usize, #[case] window_size: (u32, u32), #[case] local: (f64, f64)) {
+    let outputs = [output((0, 0), (1920, 1080), (1920, 1080))];
+    let layout = MonitorLayout::from_local_outputs(&outputs, 0).unwrap();
+
+    assert_eq!(layout.position_on_outputs(&outputs, source, window_size, local), None);
+}
 
 // oracle: reference captured Wayland output layout; HDMI and DP are adjacent, and the laptop starts 120 logical pixels lower.
 #[test]
