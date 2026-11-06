@@ -15,8 +15,13 @@ pub struct MonitorSelection {
     pub preferred_size: (Option<u16>, Option<u16>),
 }
 
+pub(crate) struct SelectedOutput {
+    pub monitor: MonitorHandle,
+    pub name: String,
+}
+
 impl MonitorSelection {
-    pub(crate) fn resolve(&self, event_loop: &ActiveEventLoop) -> anyhow::Result<(MonitorLayout, Vec<String>)> {
+    pub(crate) fn resolve(&self, event_loop: &ActiveEventLoop) -> anyhow::Result<(MonitorLayout, Vec<SelectedOutput>)> {
         let available: Vec<_> = event_loop.available_monitors().collect();
         let mut selected = Vec::new();
         for selector in &self.selectors {
@@ -49,11 +54,14 @@ impl MonitorSelection {
                 )
             })
             .collect();
-        let names = selected
+        let outputs = selected
             .iter()
-            .map(|&index| available[index].name().unwrap_or_else(|| format!("output {index}")))
+            .map(|&index| SelectedOutput {
+                monitor: available[index].clone(),
+                name: available[index].name().unwrap_or_else(|| format!("output {index}")),
+            })
             .collect();
-        Ok((MonitorLayout::horizontal(&sizes, primary)?, names))
+        Ok((MonitorLayout::horizontal(&sizes, primary)?, outputs))
     }
 }
 
