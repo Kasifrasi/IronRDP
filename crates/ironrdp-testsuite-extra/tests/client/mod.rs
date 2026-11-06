@@ -10,5 +10,6 @@ mod network_characteristics;
 mod output_channel;
 mod rail;
 mod remote_guard;
+mod resize;
 mod telemetry;
 mod viewer_rail;

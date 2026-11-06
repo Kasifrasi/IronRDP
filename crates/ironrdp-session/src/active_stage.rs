@@ -52,6 +52,7 @@ pub struct ActiveStage {
     enable_server_pointer: bool,
     window_support_level: Option<WindowSupportLevel>,
     graphics_output_needs_full_refresh: bool,
+    graphics_output_reset: Option<(u16, u16)>,
     damage_regions: Vec<InclusiveRectangle>,
 }
 
@@ -110,6 +111,7 @@ impl ActiveStageBuilder {
             enable_server_pointer,
             window_support_level: None,
             graphics_output_needs_full_refresh: false,
+            graphics_output_reset: None,
             damage_regions: Vec::new(),
         }
     }
@@ -153,6 +155,16 @@ impl ActiveStage {
     /// Takes the exact framebuffer regions changed by the most recent processing call.
     pub fn take_damage_regions(&mut self) -> Vec<InclusiveRectangle> {
         core::mem::take(&mut self.damage_regions)
+    }
+
+    /// Takes the dimensions of the most recent successfully applied EGFX output reset.
+    ///
+    /// Resets with unchanged dimensions are reported as well.
+    /// See [MS-RDPEGFX 3.3.5.14], "Processing an RDPGFX_RESET_GRAPHICS_PDU message".
+    ///
+    /// [MS-RDPEGFX 3.3.5.14]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/f39e0c2d-004e-400e-8ef2-7f52d1f62d49
+    pub fn take_graphics_output_reset(&mut self) -> Option<(u16, u16)> {
+        self.graphics_output_reset.take()
     }
 
     /// Encodes outgoing input events and modifies image if necessary (e.g for client-side pointer
@@ -390,6 +402,7 @@ impl ActiveStage {
             return Ok((None, Vec::new()));
         };
         if composited.reset {
+            self.graphics_output_reset = Some((image.width(), image.height()));
             self.graphics_output_needs_full_refresh = true;
         }
         self.damage_regions.extend(composited.regions);
@@ -504,6 +517,7 @@ impl ActiveStage {
         // The x224 processor encodes ShareDataPdu with the server's (possibly new) share_id.
         self.x224_processor.set_share_id(share_id);
         self.enable_server_pointer = enable_server_pointer;
+        self.graphics_output_reset = None;
 
         true
     }
