@@ -795,6 +795,9 @@ impl RpcApp {
         match event {
             RdpOutputEvent::Connected => {
                 self.close_requested = false;
+                if let Some(monitors) = &mut self.monitor_windows {
+                    monitors.connected();
+                }
                 info!("RDP session connected");
             }
             RdpOutputEvent::MonitorLayout(monitors) => {
@@ -805,6 +808,10 @@ impl RpcApp {
                     if let Err(error) = windows.set_layout(event_loop, &self.context, &monitors) {
                         error!(%error, "Failed to apply monitor layout");
                         event_loop.exit();
+                    }
+                    // Let the server finish painting a new layout before sending another resize.
+                    if self.resize_timeout.is_some() {
+                        self.resize_timeout = Some(Instant::now() + Duration::from_secs(1));
                     }
                     self.release_pending = true;
                     self.send_pending_rail_input();
@@ -823,7 +830,12 @@ impl RpcApp {
                     }
                 }
             }
-            RdpOutputEvent::LoginComplete => info!("RDP login complete"),
+            RdpOutputEvent::LoginComplete => {
+                info!("RDP login complete");
+                if let Some(monitors) = &mut self.monitor_windows {
+                    monitors.login_completed();
+                }
+            }
             // The viewer sends absolute pointer events only, so no input depends on these flags.
             RdpOutputEvent::ServerInputFlags(_) => {}
             RdpOutputEvent::RemoteSessionId(session_id) => debug!(session_id, "Remote session ID"),
@@ -1033,11 +1045,15 @@ impl RpcApp {
                     self.release_pending = true;
                     self.send_pending_rail_input();
                 }
-                if let Some(monitors) = &mut self.monitor_windows
-                    && let Err(error) = monitors.update(event_loop, &self.context, &update)
-                {
-                    error!(%error, "Failed to apply desktop update");
-                    event_loop.exit();
+                if let Some(monitors) = &mut self.monitor_windows {
+                    if let Err(error) = monitors.update(event_loop, &self.context, &update) {
+                        error!(%error, "Failed to apply desktop update");
+                        event_loop.exit();
+                    }
+                    if monitors.pending_resize().is_some() {
+                        self.resize_timeout
+                            .get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
+                    }
                 }
             }
             // Only produced when the virtual desktop control channel is configured, which the viewer does not do.
