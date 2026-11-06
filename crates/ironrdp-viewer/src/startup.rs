@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 use ironrdp::client::rdp::{RdpInputSender, RdpOutputEvent};
+use raw_window_handle::{HasDisplayHandle as _, RawDisplayHandle};
 use tracing::{debug, error};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -44,6 +45,10 @@ impl<'a> WindowedApp<'a> {
         options: DesktopOptions,
         connect: Connect<'a>,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !options.fullscreen || options.selection.is_some(),
+            "fullscreen requires selected local outputs"
+        );
         let primary = options
             .layout
             .monitors()
@@ -96,7 +101,7 @@ impl<'a> WindowedApp<'a> {
         layout.to_display_control(scale_factor)?;
         desktop.windows.prepare(layout.clone());
         desktop.windows.set_scale_factor(scale_factor)?;
-        debug!(?sizes, desktop_size = ?layout.size(), "Native desktop windows are ready; starting connection");
+        debug!(?sizes, desktop_size = ?layout.size(), fullscreen = desktop.options.fullscreen, "Native desktop windows are ready; starting connection");
         let sender = (desktop.connect)(&layout, scale_factor)?;
         self.state = State::Running(Box::new(App::from_prepared_desktop(
             desktop.context,
@@ -113,10 +118,22 @@ impl ApplicationHandler<RdpOutputEvent> for WindowedApp<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         match &mut self.state {
             State::Preparing(desktop) => {
+                // Other winit backends can return the requested state before fullscreen is applied.
+                if desktop.options.fullscreen
+                    && !event_loop
+                        .display_handle()
+                        .is_ok_and(|handle| matches!(handle.as_raw(), RawDisplayHandle::Wayland(_)))
+                {
+                    self.fail(
+                        event_loop,
+                        anyhow::anyhow!("confirmed fullscreen startup requires Wayland"),
+                    );
+                    return;
+                }
                 if let Some(selection) = desktop.options.selection.take() {
                     match selection.resolve(event_loop) {
-                        Ok((layout, names)) => {
-                            desktop.windows.set_output_names(names);
+                        Ok((layout, outputs)) => {
+                            desktop.windows.set_outputs(outputs, desktop.options.fullscreen);
                             desktop.windows.prepare(layout.clone());
                             desktop.options.layout = layout;
                         }
@@ -149,12 +166,10 @@ impl ApplicationHandler<RdpOutputEvent> for WindowedApp<'_> {
             WindowEvent::CloseRequested => {
                 self.state = State::Closed;
                 event_loop.exit();
-                return;
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = desktop.windows.draw(window_id) {
                     self.fail(event_loop, error);
-                    return;
                 }
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
@@ -163,31 +178,51 @@ impl ApplicationHandler<RdpOutputEvent> for WindowedApp<'_> {
                     window.request_redraw();
                 }
             }
-            _ => return,
-        }
-        if desktop.windows.native_sizes().is_some() {
-            // Let mapping and tiling changes across all newly created windows settle together.
-            desktop
-                .ready_at
-                .get_or_insert_with(|| Instant::now() + Duration::from_millis(100));
+            _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let State::Preparing(desktop) = &self.state else {
+        let State::Preparing(desktop) = &mut self.state else {
             if let State::Running(app) = &mut self.state {
                 app.about_to_wait(event_loop);
             }
             return;
         };
-        if desktop.expires_at <= Instant::now() {
-            self.fail(event_loop, anyhow::anyhow!("native window configuration timed out"));
-        } else if desktop.ready_at.is_some_and(|deadline| deadline <= Instant::now()) {
+        let fullscreen_ready = match desktop.windows.fullscreen_ready(event_loop) {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.fail(event_loop, error);
+                return;
+            }
+        };
+        let now = Instant::now();
+        if fullscreen_ready && desktop.windows.native_sizes().is_some() {
+            // Let mapping and tiling changes across all newly created windows settle together.
+            desktop.ready_at.get_or_insert(now + Duration::from_millis(100));
+        } else {
+            desktop.ready_at = None;
+        }
+        if desktop.expires_at <= now {
+            let message = if desktop.options.fullscreen {
+                "fullscreen windows were not ready on their selected outputs within 10 seconds"
+            } else {
+                "native window configuration timed out"
+            };
+            self.fail(event_loop, anyhow::anyhow!(message));
+        } else if desktop.ready_at.is_some_and(|deadline| deadline <= now) {
             if let Err(error) = self.connect() {
                 self.fail(event_loop, error);
             }
         } else {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(desktop.ready_at.unwrap_or(desktop.expires_at)));
+            // Output-enter notifications can update the backend without a public window event.
+            let pending = if desktop.options.fullscreen {
+                now + Duration::from_millis(50)
+            } else {
+                desktop.expires_at
+            };
+            let deadline = desktop.ready_at.unwrap_or(pending).min(desktop.expires_at);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         }
     }
 

@@ -245,6 +245,11 @@ struct Args {
     #[clap(long, value_name = "NAME_OR_ID", requires = "monitors")]
     primary_monitor: Option<String>,
 
+    /// Request borderless fullscreen on every selected output before connecting (Wayland).
+    /// Fails before connecting if fullscreen on the selected outputs is not confirmed.
+    #[clap(long, requires = "monitors")]
+    fullscreen: bool,
+
     /// Set required color depth. Currently only 32 and 16 bit color depths are supported
     #[clap(long)]
     color_depth: Option<u32>,
@@ -656,6 +661,7 @@ pub struct DesktopOptions {
     pub layout: crate::monitor::MonitorLayout,
     pub scale_factor: Option<u32>,
     pub selection: Option<crate::outputs::MonitorSelection>,
+    pub fullscreen: bool,
 }
 
 impl ViewerConfig {
@@ -893,6 +899,7 @@ impl ViewerConfig {
                             .or_else(|| properties.desktop_height().ok().flatten()),
                     ),
                 }),
+                fullscreen: args.fullscreen,
             })
         };
 

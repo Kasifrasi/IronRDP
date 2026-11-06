@@ -7,9 +7,10 @@ use ironrdp::pdu::gcc::Monitor;
 use tracing::{info, warn};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event_loop::{ActiveEventLoop, OwnedDisplayHandle};
-use winit::window::{Cursor, Window, WindowAttributes, WindowId};
+use winit::window::{Cursor, Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::monitor::{DesktopFrame, MonitorLayout, MonitorResizeState, MonitorViewport};
+use crate::outputs::SelectedOutput;
 use crate::rail::bounded_window_size;
 
 type Surface = softbuffer::Surface<OwnedDisplayHandle, Arc<Window>>;
@@ -23,14 +24,15 @@ struct DesktopWindow {
     window: Arc<Window>,
     surface: Surface,
     viewport: Option<MonitorViewport>,
-    presented: bool,
+    presented_size: Option<PhysicalSize<u32>>,
 }
 
 /// Presents a shared desktop in windows using the server's monitor definitions.
 pub(crate) struct MonitorWindows {
     windows: Vec<DesktopWindow>,
     preferred_primary: MonitorId,
-    output_names: Vec<String>,
+    outputs: Vec<SelectedOutput>,
+    fullscreen: bool,
     layout: Option<MonitorLayout>,
     frame: DesktopFrame,
     awaiting_frame: bool,
@@ -41,8 +43,9 @@ pub(crate) struct MonitorWindows {
 }
 
 impl MonitorWindows {
-    pub(crate) fn set_output_names(&mut self, names: Vec<String>) {
-        self.output_names = names;
+    pub(crate) fn set_outputs(&mut self, outputs: Vec<SelectedOutput>, fullscreen: bool) {
+        self.outputs = outputs;
+        self.fullscreen = fullscreen;
     }
 
     pub(crate) fn prepare(&mut self, layout: MonitorLayout) {
@@ -58,16 +61,39 @@ impl MonitorWindows {
     }
 
     pub(crate) fn native_sizes(&self) -> Option<Vec<(u32, u32)>> {
-        if self.windows.is_empty() || self.windows.iter().any(|view| !view.presented) {
+        if self.windows.is_empty() {
             return None;
         }
         (0..self.windows.len())
             .map(|index| {
                 let view = self.windows.iter().find(|view| view.remote_index == index)?;
                 let size = view.window.inner_size();
-                (size.width != 0 && size.height != 0).then_some((size.width, size.height))
+                (size.width != 0 && size.height != 0 && view.presented_size == Some(size))
+                    .then_some((size.width, size.height))
             })
             .collect()
+    }
+
+    pub(crate) fn fullscreen_ready(&self, event_loop: &ActiveEventLoop) -> anyhow::Result<bool> {
+        if !self.fullscreen {
+            return Ok(true);
+        }
+        let available: Vec<_> = event_loop.available_monitors().collect();
+        for output in &self.outputs {
+            anyhow::ensure!(
+                available.contains(&output.monitor),
+                "selected fullscreen output {:?} is no longer available",
+                output.name
+            );
+        }
+        // UNTESTED: connect only after fullscreen and the selected output are confirmed by the window system.
+        // Check single and multiple outputs, including a non-first primary, when updating winit or this gate.
+        Ok(self.windows.iter().all(|view| {
+            self.outputs.get(view.monitor_id.0).is_some_and(|output| {
+                matches!(view.window.fullscreen(), Some(Fullscreen::Borderless(_)))
+                    && view.window.current_monitor().as_ref() == Some(&output.monitor)
+            })
+        }))
     }
 
     pub(crate) fn native_scale_factor(&self) -> u32 {
@@ -102,7 +128,8 @@ impl MonitorWindows {
         Self {
             windows: Vec::new(),
             preferred_primary: MonitorId(0),
-            output_names: Vec::new(),
+            outputs: Vec::new(),
+            fullscreen: false,
             layout: None,
             frame: DesktopFrame::default(),
             awaiting_frame: true,
@@ -256,9 +283,9 @@ impl MonitorWindows {
                     format!(
                         "IronRDP - Monitor {}{}{}",
                         monitor_id.0 + 1,
-                        self.output_names
+                        self.outputs
                             .get(monitor_id.0)
-                            .map_or_else(String::new, |name| format!(" [{name}]")),
+                            .map_or_else(String::new, |output| format!(" [{}]", output.name)),
                         if viewport.primary { " (primary)" } else { "" }
                     )
                 }
@@ -275,13 +302,17 @@ impl MonitorWindows {
                     PhysicalSize::new(u32::from(view.width), u32::from(view.height))
                 });
                 let (width, height) = bounded_window_size(size.width, size.height);
-                let window = Arc::new(
-                    event_loop.create_window(
-                        WindowAttributes::default()
-                            .with_title(&title)
-                            .with_inner_size(PhysicalSize::new(width, height)),
-                    )?,
-                );
+                let mut attributes = WindowAttributes::default()
+                    .with_title(&title)
+                    .with_inner_size(PhysicalSize::new(width, height));
+                if self.fullscreen {
+                    let output = self
+                        .outputs
+                        .get(monitor_id.0)
+                        .context("monitor has no selected output")?;
+                    attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(Some(output.monitor.clone()))));
+                }
+                let window = Arc::new(event_loop.create_window(attributes)?);
                 window.set_cursor(self.cursor.clone());
                 window.set_cursor_visible(self.cursor_visible);
                 let surface = softbuffer::Surface::new(context, Arc::clone(&window))
@@ -292,7 +323,7 @@ impl MonitorWindows {
                     window,
                     surface,
                     viewport,
-                    presented: false,
+                    presented_size: None,
                 });
             }
         }
@@ -337,7 +368,7 @@ impl MonitorWindows {
             .present()
             .map_err(|error| anyhow::anyhow!("unable to present monitor buffer: {error}"))
             .context("monitor redraw")?;
-        view.presented = true;
+        view.presented_size = Some(size);
         Ok(())
     }
 

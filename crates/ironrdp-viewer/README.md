@@ -57,6 +57,18 @@ The connection still uses the actual native window sizes after the compositor co
 Output selection assigns monitor views and does not position normal windows on Wayland; the compositor controls their placement.
 `--monitors` cannot be combined with `--monitor-count`, RemoteApp, RPC mode or `--dump-rdp`.
 
+On Wayland, add `--fullscreen` to request one borderless fullscreen window on each selected output:
+
+```shell
+ironrdp-viewer <HOSTNAME> --username <USERNAME> --monitors DP-1,HDMI-A-1 --fullscreen
+```
+
+Before connecting, every window must report fullscreen on its selected output and present at its current native size.
+If an output disappears or the windows do not become ready within ten seconds, startup ends with an error before connecting.
+Other window-system backends reject `--fullscreen` because winit can report requested state before fullscreen is applied.
+The remote monitor row still follows the selection order; local vertical offsets are not imported.
+Use the compositor's close-window action to close the fullscreen session.
+
 On Windows, the viewer redirects local drives:
 
 - `--drives` redirects every drive, including drives connected later (`drivestoredirect:s:*`).
