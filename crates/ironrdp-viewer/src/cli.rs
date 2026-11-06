@@ -230,6 +230,21 @@ struct Args {
         requires_all = ["desktop_width", "desktop_height"], conflicts_with_all = ["rpc", "remote_app"])]
     monitor_count: Option<u16>,
 
+    /// List local output names, IDs, resolutions and scales without connecting.
+    #[clap(long, conflicts_with_all = ["rpc", "remote_app", "monitor_count", "monitors", "dump_rdp"])]
+    list_monitors: bool,
+
+    /// Select local output names or zero-based IDs from --list-monitors, in remote row order.
+    /// Creates windowed monitor views; the compositor controls their placement.
+    #[clap(long, value_delimiter = ',', value_name = "NAME_OR_ID",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        conflicts_with_all = ["monitor_count", "rpc", "remote_app", "dump_rdp"])]
+    monitors: Vec<String>,
+
+    /// Choose a selected output as the primary remote monitor; defaults to the first selection.
+    #[clap(long, value_name = "NAME_OR_ID", requires = "monitors")]
+    primary_monitor: Option<String>,
+
     /// Set required color depth. Currently only 32 and 16 bit color depths are supported
     #[clap(long)]
     color_depth: Option<u32>,
@@ -632,6 +647,7 @@ pub struct ViewerConfig {
     ports: PortOptions,
     list_usb_devices: bool,
     list_audio_devices: bool,
+    list_monitors: bool,
 }
 
 /// Preferred window geometry and optional explicit desktop scaling.
@@ -639,6 +655,7 @@ pub struct ViewerConfig {
 pub struct DesktopOptions {
     pub layout: crate::monitor::MonitorLayout,
     pub scale_factor: Option<u32>,
+    pub selection: Option<crate::outputs::MonitorSelection>,
 }
 
 impl ViewerConfig {
@@ -656,7 +673,7 @@ impl ViewerConfig {
     }
 
     fn from_args(mut args: Args) -> anyhow::Result<Self> {
-        if args.usb.iter().any(|rules| rules == "list") {
+        if args.list_monitors || args.usb.iter().any(|rules| rules == "list") {
             return Ok(Self {
                 builder: ConfigBuilder::new(),
                 desktop: None,
@@ -667,8 +684,9 @@ impl ViewerConfig {
                 printers: None,
                 named_drives: Vec::new(),
                 ports: PortOptions::default(),
-                list_usb_devices: true,
+                list_usb_devices: !args.list_monitors,
                 list_audio_devices: false,
+                list_monitors: args.list_monitors,
             });
         }
 
@@ -759,6 +777,7 @@ impl ViewerConfig {
                 ports: PortOptions::default(),
                 list_usb_devices: false,
                 list_audio_devices: false,
+                list_monitors: false,
             });
         }
 
@@ -837,6 +856,7 @@ impl ViewerConfig {
         };
 
         let desktop = if args.remote_app.is_some() || properties.remote_application_mode() == Some(true) {
+            anyhow::ensure!(args.monitors.is_empty(), "--monitors cannot be combined with RemoteApp");
             None
         } else {
             let monitors = monitor_layout.as_ref().map_or_else(
@@ -864,6 +884,15 @@ impl ViewerConfig {
                 scale_factor: args
                     .scale_desktop
                     .or_else(|| properties.desktop_scale_factor().ok().flatten()),
+                selection: (!args.monitors.is_empty()).then(|| crate::outputs::MonitorSelection {
+                    selectors: core::mem::take(&mut args.monitors),
+                    primary: args.primary_monitor.take(),
+                    preferred_size: (
+                        args.desktop_width.or_else(|| properties.desktop_width().ok().flatten()),
+                        args.desktop_height
+                            .or_else(|| properties.desktop_height().ok().flatten()),
+                    ),
+                }),
             })
         };
 
@@ -909,6 +938,7 @@ impl ViewerConfig {
             ports,
             list_usb_devices: false,
             list_audio_devices,
+            list_monitors: false,
         })
     }
 
@@ -928,6 +958,11 @@ impl ViewerConfig {
     /// Returns the preferred local desktop windows, or none for RemoteApp and RPC mode.
     pub fn desktop_options(&self) -> Option<&DesktopOptions> {
         self.desktop.as_ref()
+    }
+
+    /// Whether to list local outputs without connecting.
+    pub fn list_monitors(&self) -> bool {
+        self.list_monitors
     }
 
     /// Path to the log file requested on the CLI, if any.

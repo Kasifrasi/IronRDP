@@ -41,6 +41,22 @@ If the server supplies no usable monitor layout, one window shows the combined d
 This mode supports 2–16 virtual monitors and requires explicit per-monitor dimensions.
 It is available in direct desktop mode; RemoteApp and RPC mode use their existing window behavior.
 
+To list local outputs and select two of them by name:
+
+```shell
+ironrdp-viewer --list-monitors
+ironrdp-viewer <HOSTNAME> --username <USERNAME> --monitors DP-1,HDMI-A-1 --primary-monitor HDMI-A-1
+```
+
+Use the exact names reported by `--list-monitors`, or their zero-based IDs for the current enumeration.
+Names are preferable in saved commands; reconnecting displays can change the IDs.
+The selection order defines a horizontal remote row, and the first selected output is primary unless `--primary-monitor` chooses another selected output.
+Each window keeps its monitor identifier and selected output name when the server reports the horizontal row in a different order.
+Selected output resolutions supply the preferred sizes unless `--desktop-width` or `--desktop-height` overrides them.
+The connection still uses the actual native window sizes after the compositor configures them.
+Output selection assigns monitor views and does not position normal windows on Wayland; the compositor controls their placement.
+`--monitors` cannot be combined with `--monitor-count`, RemoteApp, RPC mode or `--dump-rdp`.
+
 On Windows, the viewer redirects local drives:
 
 - `--drives` redirects every drive, including drives connected later (`drivestoredirect:s:*`).

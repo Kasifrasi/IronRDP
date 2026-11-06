@@ -113,6 +113,19 @@ impl ApplicationHandler<RdpOutputEvent> for WindowedApp<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         match &mut self.state {
             State::Preparing(desktop) => {
+                if let Some(selection) = desktop.options.selection.take() {
+                    match selection.resolve(event_loop) {
+                        Ok((layout, names)) => {
+                            desktop.windows.set_output_names(names);
+                            desktop.windows.prepare(layout.clone());
+                            desktop.options.layout = layout;
+                        }
+                        Err(error) => {
+                            self.fail(event_loop, error);
+                            return;
+                        }
+                    }
+                }
                 if let Err(error) = desktop.windows.sync_windows(event_loop, &desktop.context) {
                     self.fail(event_loop, error);
                 }
