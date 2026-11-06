@@ -83,7 +83,159 @@ pub struct MonitorLayout {
     size: (u16, u16),
 }
 
+/// A local output in logical desktop coordinates with its native window size in pixels.
+#[derive(Debug, Clone, Copy)]
+pub struct OutputGeometry {
+    pub position: (i32, i32),
+    pub logical_size: (u32, u32),
+    pub native_size: (u32, u32),
+}
+
+impl OutputGeometry {
+    fn edges(self) -> (i64, i64, i64, i64) {
+        let left = i64::from(self.position.0);
+        let top = i64::from(self.position.1);
+        (
+            left,
+            top,
+            left + i64::from(self.logical_size.0),
+            top + i64::from(self.logical_size.1),
+        )
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        let (left, top, right, bottom) = self.edges();
+        let (other_left, other_top, other_right, other_bottom) = other.edges();
+        left < other_right && other_left < right && top < other_bottom && other_top < bottom
+    }
+
+    fn neighbor_at(self, position: (i64, i64), other: Self) -> Option<(i64, i64)> {
+        let (left, top, right, bottom) = self.edges();
+        let (other_left, other_top, other_right, other_bottom) = other.edges();
+        let horizontal = (right == other_left || other_right == left) && top <= other_bottom && other_top <= bottom;
+        let vertical = (bottom == other_top || other_bottom == top) && left <= other_right && other_left <= right;
+        if !horizontal && !vertical {
+            return None;
+        }
+        let scaled = |delta: i64, native: u32, logical: u32| {
+            let numerator = delta * i64::from(native);
+            (numerator + numerator.signum() * (i64::from(logical) / 2)) / i64::from(logical)
+        };
+        let x = if horizontal {
+            if other_left < left {
+                position.0 - i64::from(other.native_size.0)
+            } else {
+                position.0 + i64::from(self.native_size.0)
+            }
+        } else {
+            position.0 + scaled(other_left - left, self.native_size.0, self.logical_size.0)
+        };
+        let y = if vertical {
+            if other_top < top {
+                position.1 - i64::from(other.native_size.1)
+            } else {
+                position.1 + i64::from(self.native_size.1)
+            }
+        } else {
+            position.1 + scaled(other_top - top, self.native_size.1, self.logical_size.1)
+        };
+        let horizontal_contact = horizontal
+            && position.1 <= y + i64::from(other.native_size.1)
+            && y <= position.1 + i64::from(self.native_size.1);
+        let vertical_contact = vertical
+            && position.0 <= x + i64::from(other.native_size.0)
+            && x <= position.0 + i64::from(self.native_size.0);
+        (horizontal_contact || vertical_contact).then_some((x, y))
+    }
+}
+
 impl MonitorLayout {
+    /// Reconstructs local output adjacency while preserving native remote resolutions.
+    /// Output rectangles must form a connected, nonoverlapping logical layout.
+    /// Native rectangles are placed through logical neighbors, so mixed scales can change edge alignment.
+    pub fn from_local_outputs(outputs: &[OutputGeometry], primary: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (1..=MONITOR_COUNT_MAX).contains(&outputs.len()) && primary < outputs.len(),
+            "invalid monitor selection"
+        );
+        for output in outputs {
+            anyhow::ensure!(
+                output.logical_size.0 != 0
+                    && output.logical_size.1 != 0
+                    && output.native_size.0 != 0
+                    && output.native_size.1 != 0,
+                "output geometry is empty"
+            );
+            anyhow::ensure!(
+                MonitorLayoutEntry::adjust_display_size(output.native_size.0, output.native_size.1)
+                    == output.native_size,
+                "native output resolution is unsupported by RDP; use a horizontal monitor layout"
+            );
+        }
+        for (index, output) in outputs.iter().enumerate() {
+            anyhow::ensure!(
+                !outputs[..index].iter().any(|other| output.overlaps(*other)),
+                "local output rectangles overlap; use a horizontal monitor layout"
+            );
+        }
+        // A spatial anchor keeps native geometry independent of selection order and primary choice.
+        let mut order: Vec<_> = (0..outputs.len()).collect();
+        order.sort_by_key(|&index| outputs[index].position);
+        let anchor = order[0];
+        let mut positions = vec![None; outputs.len()];
+        positions[anchor] = Some((0, 0));
+        let mut queue = vec![(anchor, (0, 0))];
+        let mut cursor = 0;
+        while let Some(&(reference, position)) = queue.get(cursor) {
+            for &index in &order {
+                if positions[index].is_none()
+                    && let Some(position) = outputs[reference].neighbor_at(position, outputs[index])
+                {
+                    positions[index] = Some(position);
+                    queue.push((index, position));
+                }
+            }
+            cursor += 1;
+        }
+        let positions = positions.into_iter().collect::<Option<Vec<_>>>().ok_or_else(|| {
+            anyhow::anyhow!(
+                "selected outputs are not connected; select adjacent outputs or use a horizontal monitor layout"
+            )
+        })?;
+        let origin = positions[primary];
+        let monitors = outputs
+            .iter()
+            .zip(&positions)
+            .enumerate()
+            .map(|(index, (output, position))| {
+                let left = i32::try_from(position.0 - origin.0)?;
+                let top = i32::try_from(position.1 - origin.1)?;
+                Ok(Monitor {
+                    left,
+                    top,
+                    right: left
+                        .checked_add(i32::try_from(output.native_size.0)? - 1)
+                        .ok_or_else(|| anyhow::anyhow!("monitor position is out of range"))?,
+                    bottom: top
+                        .checked_add(i32::try_from(output.native_size.1)? - 1)
+                        .ok_or_else(|| anyhow::anyhow!("monitor position is out of range"))?,
+                    flags: if index == primary {
+                        MonitorFlags::PRIMARY
+                    } else {
+                        MonitorFlags::empty()
+                    },
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let layout = Self::new(&monitors)?;
+        anyhow::ensure!(
+            usize::from(layout.size.0) * usize::from(layout.size.1) <= MAX_FRAME_BYTES / 4,
+            "monitor layout exceeds viewer framebuffer memory limit"
+        );
+        layout.to_display_control(100)?;
+        Ok(layout)
+    }
+
     pub(crate) fn horizontal(sizes: &[(u32, u32)], primary: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(
             (1..=MONITOR_COUNT_MAX).contains(&sizes.len()) && primary < sizes.len(),
@@ -173,6 +325,29 @@ impl MonitorLayout {
             // Verify a non-first primary monitor and resize both windows when changing this ordering.
             self.monitors.sort_by_key(|monitor| monitor.x);
         }
+    }
+
+    /// Restores output identity when a server reports the same rectangles in another order.
+    pub fn reorder_to_match(&mut self, reference: &Self) -> bool {
+        if self.monitors.len() != reference.monitors.len() {
+            return false;
+        }
+        let ordered = reference
+            .monitors
+            .iter()
+            .map(|wanted| {
+                self.monitors
+                    .iter()
+                    .find(|monitor| {
+                        (monitor.x, monitor.y, monitor.width, monitor.height)
+                            == (wanted.x, wanted.y, wanted.width, wanted.height)
+                    })
+                    .copied()
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(ordered) = ordered else { return false };
+        self.monitors = ordered;
+        true
     }
 
     /// Returns the bounding framebuffer dimensions.
