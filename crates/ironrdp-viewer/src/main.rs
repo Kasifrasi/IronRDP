@@ -326,6 +326,7 @@ fn setup_logging(log_file: Option<&str>) -> anyhow::Result<()> {
         .with_default_directive(LevelFilter::WARN.into())
         .with_env_var("IRONRDP_LOG")
         .from_env_lossy();
+    let filter_description = env_filter.to_string();
 
     if let Some(log_file) = log_file {
         let file = OpenOptions::new()
@@ -356,6 +357,7 @@ fn setup_logging(log_file: Option<&str>) -> anyhow::Result<()> {
             .context("failed to set tracing global subscriber")?;
     };
 
+    tracing::info!(filter = %filter_description, "Logging initialized");
     Ok(())
 }
 
