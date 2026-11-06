@@ -11,6 +11,7 @@ use ironrdp::client::config::{
     MissingField, TransportKind, VmConnectMode,
 };
 use ironrdp::client::usb::UsbRedirectionConfig;
+use ironrdp::pdu::gcc::{ClientMonitorData, Monitor, MonitorFlags};
 use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
 use ironrdp_cfg::PropertySetExt as _;
 use ironrdp_propertyset::Value;
@@ -221,6 +222,13 @@ struct Args {
     /// Desired desktop height for the RDP session
     #[clap(long, value_parser = clap::value_parser!(u16).range(1..=8192))]
     desktop_height: Option<u16>,
+
+    /// Open one window per virtual monitor in a horizontal row, with the first monitor primary.
+    /// --desktop-width and --desktop-height specify each monitor's resolution.
+    /// Window resizing scales its view; closing any window closes the connection.
+    #[clap(long, value_parser = clap::value_parser!(u16).range(2..=16),
+        requires_all = ["desktop_width", "desktop_height"], conflicts_with_all = ["rpc", "remote_app"])]
+    monitor_count: Option<u16>,
 
     /// Set required color depth. Currently only 32 and 16 bit color depths are supported
     #[clap(long)]
@@ -676,6 +684,37 @@ impl ViewerConfig {
         let log_file = args.log_file.clone();
         let dump_rdp = args.dump_rdp.clone();
         let list_audio_devices = args.list_audio_devices;
+        let monitor_layout = args
+            .monitor_count
+            .map(|count| {
+                let width = args.desktop_width.context("--monitor-count requires --desktop-width")?;
+                let height = args
+                    .desktop_height
+                    .context("--monitor-count requires --desktop-height")?;
+                anyhow::ensure!(
+                    200 <= width && 200 <= height,
+                    "each monitor must be at least 200 pixels in each dimension"
+                );
+                let total_width = width
+                    .checked_mul(count)
+                    .filter(|width| *width <= 32_766)
+                    .context("combined monitor width exceeds 32766 pixels")?;
+                let monitors = (0..count)
+                    .map(|index| Monitor {
+                        left: i32::from(index) * i32::from(width),
+                        top: 0,
+                        right: (i32::from(index) + 1) * i32::from(width) - 1,
+                        bottom: i32::from(height) - 1,
+                        flags: if index == 0 {
+                            MonitorFlags::PRIMARY
+                        } else {
+                            MonitorFlags::empty()
+                        },
+                    })
+                    .collect();
+                Ok::<_, anyhow::Error>((total_width, ClientMonitorData { monitors }))
+            })
+            .transpose()?;
 
         if args.rpc {
             if args.rdp_file.is_some() || dump_rdp.is_some() {
@@ -789,6 +828,13 @@ impl ViewerConfig {
 
         // CLI arguments take precedence: apply them on top of the `.rdp`-derived builder.
         let mut builder = apply_cli_to_builder(builder, args, redirect_clipboard, redirect_webauthn);
+        if let Some((width, layout)) = monitor_layout {
+            anyhow::ensure!(
+                properties.remote_application_mode() != Some(true),
+                "--monitor-count cannot be combined with RemoteApp"
+            );
+            builder = builder.with_desktop_width(width).with_monitor_layout(layout);
+        }
         if let Some(usb) = usb {
             builder = builder.with_usb_redirection(Some(usb));
         }
