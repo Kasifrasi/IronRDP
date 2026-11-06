@@ -30,6 +30,7 @@ struct DesktopWindow {
 pub(crate) struct MonitorWindows {
     windows: Vec<DesktopWindow>,
     preferred_primary: MonitorId,
+    output_names: Vec<String>,
     layout: Option<MonitorLayout>,
     frame: DesktopFrame,
     awaiting_frame: bool,
@@ -40,6 +41,10 @@ pub(crate) struct MonitorWindows {
 }
 
 impl MonitorWindows {
+    pub(crate) fn set_output_names(&mut self, names: Vec<String>) {
+        self.output_names = names;
+    }
+
     pub(crate) fn prepare(&mut self, layout: MonitorLayout) {
         self.preferred_primary = MonitorId(
             layout
@@ -97,6 +102,7 @@ impl MonitorWindows {
         Self {
             windows: Vec::new(),
             preferred_primary: MonitorId(0),
+            output_names: Vec::new(),
             layout: None,
             frame: DesktopFrame::default(),
             awaiting_frame: true,
@@ -248,8 +254,11 @@ impl MonitorWindows {
                         .is_some_and(|layout| layout.size() == size || size == (0, 0)) =>
                 {
                     format!(
-                        "IronRDP - Monitor {}{}",
+                        "IronRDP - Monitor {}{}{}",
                         monitor_id.0 + 1,
+                        self.output_names
+                            .get(monitor_id.0)
+                            .map_or_else(String::new, |name| format!(" [{name}]")),
                         if viewport.primary { " (primary)" } else { "" }
                     )
                 }

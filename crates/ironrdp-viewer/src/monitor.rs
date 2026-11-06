@@ -84,6 +84,29 @@ pub struct MonitorLayout {
 }
 
 impl MonitorLayout {
+    pub(crate) fn horizontal(sizes: &[(u32, u32)], primary: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (1..=MONITOR_COUNT_MAX).contains(&sizes.len()) && primary < sizes.len(),
+            "invalid monitor selection"
+        );
+        let monitors = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, &(width, height))| {
+                anyhow::ensure!(width != 0 && height != 0, "selected output has no usable resolution");
+                let (width, height) = MonitorLayoutEntry::adjust_display_size(width, height);
+                Ok(MonitorViewport {
+                    x: u16::try_from(index)?,
+                    y: 0,
+                    width: u16::try_from(width)?,
+                    height: u16::try_from(height)?,
+                    primary: index == primary,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Self::arrange_horizontal(monitors)
+    }
+
     /// Converts inclusive primary-relative monitor rectangles into framebuffer rectangles.
     ///
     /// See ["Monitor Definition (TS_MONITOR_DEF)"] for the server coordinate system.

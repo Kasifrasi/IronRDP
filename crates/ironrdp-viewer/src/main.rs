@@ -23,6 +23,10 @@ fn main() -> anyhow::Result<()> {
 
     setup_logging(cli.log_file()).context("unable to initialize logging")?;
 
+    if cli.list_monitors() {
+        return ironrdp_viewer::outputs::list_monitors();
+    }
+
     if cli.rpc_mode() {
         return run_rpc(cli).context("RPC server");
     }
