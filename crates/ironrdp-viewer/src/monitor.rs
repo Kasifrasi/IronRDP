@@ -144,6 +144,14 @@ impl MonitorLayout {
         &self.monitors
     }
 
+    pub(crate) fn order_horizontal(&mut self) {
+        if self.monitors.iter().all(|monitor| monitor.y == 0) {
+            // UNTESTED: server array order must not swap windows in a horizontal monitor row.
+            // Verify a non-first primary monitor and resize both windows when changing this ordering.
+            self.monitors.sort_by_key(|monitor| monitor.x);
+        }
+    }
+
     /// Returns the bounding framebuffer dimensions.
     pub fn size(&self) -> (u16, u16) {
         self.size
