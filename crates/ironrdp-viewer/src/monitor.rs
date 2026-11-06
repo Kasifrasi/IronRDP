@@ -1,13 +1,14 @@
 //! Monitor rectangles in the shared desktop framebuffer.
 
 use core::time::Duration;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use ironrdp::client::rdp::DesktopUpdate;
 use ironrdp::displaycontrol::pdu::{DeviceScaleFactor, DisplayControlMonitorLayout, MonitorLayoutEntry};
 use ironrdp::input::MousePosition;
 use ironrdp::pdu::gcc::{ClientMonitorData, MONITOR_COUNT_MAX, Monitor, MonitorFlags};
-use ironrdp::pdu::geometry::{ExclusiveRectangle, InclusiveRectangle};
+use ironrdp::pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
 
 /// Maximum memory retained for a shared desktop, matching the graphics compositor's limit.
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
@@ -35,6 +36,92 @@ impl MonitorFocusState {
         } else {
             false
         }
+    }
+}
+
+/// Accumulates target damage and repairs previously presented software buffers.
+pub struct MonitorDamage {
+    pending: Option<ExclusiveRectangle>,
+    history: VecDeque<Option<ExclusiveRectangle>>,
+    invalid: bool,
+    size: Option<(u32, u32)>,
+}
+
+impl Default for MonitorDamage {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            history: VecDeque::new(),
+            invalid: true,
+            size: None,
+        }
+    }
+}
+
+impl MonitorDamage {
+    /// Observes target size changes, including intermediate sizes before a redraw.
+    pub fn resize(&mut self, size: (u32, u32)) {
+        if self.size != Some(size) {
+            self.invalidate();
+            self.size = Some(size);
+        }
+    }
+
+    pub fn add(&mut self, region: ExclusiveRectangle) {
+        self.pending = Some(match self.pending.take() {
+            Some(pending) => pending.union(&region),
+            None => region,
+        });
+    }
+
+    pub fn invalidate(&mut self) {
+        self.pending = None;
+        self.history.clear();
+        self.invalid = true;
+    }
+
+    /// Returns the area needed to make a buffer of this age match the current image.
+    /// Age zero or missing history requires a full repaint.
+    /// See [softbuffer's buffer age] for the presentation count.
+    ///
+    /// [softbuffer's buffer age]: https://docs.rs/softbuffer/0.4.8/softbuffer/struct.Buffer.html#method.age
+    pub fn repair_region(&mut self, age: u8, size: (u32, u32)) -> Option<ExclusiveRectangle> {
+        self.resize(size);
+        if self.invalid || age == 0 || self.history.len() < usize::from(age) - 1 {
+            return Self::full_region(size);
+        }
+        self.history
+            .iter()
+            .take(usize::from(age) - 1)
+            .flatten()
+            .fold(self.pending.clone(), |pending, region| {
+                Some(pending.map_or_else(|| region.clone(), |pending| pending.union(region)))
+            })
+    }
+
+    /// Records visible changes only after a successful presentation.
+    pub fn presented(&mut self, size: (u32, u32)) {
+        self.resize(size);
+        let changed = if self.invalid {
+            Self::full_region(size)
+        } else {
+            self.pending.take()
+        };
+        self.history.push_front(changed);
+        self.history.truncate(8);
+        self.pending = None;
+        self.invalid = false;
+    }
+
+    fn full_region(size: (u32, u32)) -> Option<ExclusiveRectangle> {
+        let right = u16::try_from(size.0).ok()?;
+        let bottom = u16::try_from(size.1).ok()?;
+        (right != 0 && bottom != 0).then_some(ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right,
+            bottom,
+        })
     }
 }
 
@@ -103,7 +190,50 @@ impl MonitorViewport {
     /// Pixels outside the available framebuffer are black.
     /// Returns false for zero dimensions or a target buffer with the wrong length.
     pub fn render(&self, frame: &[u32], frame_size: (u16, u16), target: &mut [u32], target_size: (u32, u32)) -> bool {
+        self.render_rect(
+            frame,
+            frame_size,
+            target,
+            target_size,
+            (0, 0, target_size.0, target_size.1),
+        )
+    }
+
+    /// Paints only an exclusive target region, retaining pixels outside it.
+    pub fn render_region(
+        &self,
+        frame: &[u32],
+        frame_size: (u16, u16),
+        target: &mut [u32],
+        target_size: (u32, u32),
+        region: &ExclusiveRectangle,
+    ) -> bool {
+        self.render_rect(
+            frame,
+            frame_size,
+            target,
+            target_size,
+            (
+                u32::from(region.left),
+                u32::from(region.top),
+                u32::from(region.right),
+                u32::from(region.bottom),
+            ),
+        )
+    }
+
+    fn render_rect(
+        &self,
+        frame: &[u32],
+        frame_size: (u16, u16),
+        target: &mut [u32],
+        target_size: (u32, u32),
+        (left, top, right, bottom): (u32, u32, u32, u32),
+    ) -> bool {
         if target_size.0 == 0 || target_size.1 == 0 || self.width == 0 || self.height == 0 {
+            return false;
+        }
+        if !(left < right && top < bottom && right <= target_size.0 && bottom <= target_size.1) {
             return false;
         }
         let Ok(target_width) = usize::try_from(target_size.0) else {
@@ -113,9 +243,32 @@ impl MonitorViewport {
         if usize::try_from(pixel_count).ok() != Some(target.len()) {
             return false;
         }
-        for (row, output) in (0..target_size.1).zip(target.chunks_exact_mut(target_width)) {
+        let (Ok(left_index), Ok(right_index), Ok(top_index), Ok(height)) = (
+            usize::try_from(left),
+            usize::try_from(right),
+            usize::try_from(top),
+            usize::try_from(bottom - top),
+        ) else {
+            return false;
+        };
+        let native = (u32::from(self.width), u32::from(self.height)) == target_size;
+        for (row, output) in (0..target_size.1)
+            .zip(target.chunks_exact_mut(target_width))
+            .skip(top_index)
+            .take(height)
+        {
+            let output = &mut output[left_index..right_index];
             let y = u64::from(self.y) + u64::from(row) * u64::from(self.height) / u64::from(target_size.1);
-            for (column, pixel) in (0..target_size.0).zip(output.iter_mut()) {
+            if native
+                && y < u64::from(frame_size.1)
+                && u64::from(self.x) + u64::from(right) <= u64::from(frame_size.0)
+                && let Ok(offset) = usize::try_from(y * u64::from(frame_size.0) + u64::from(self.x) + u64::from(left))
+                && let Some(source) = frame.get(offset..offset + output.len())
+            {
+                output.copy_from_slice(source);
+                continue;
+            }
+            for (column, pixel) in (left..right).zip(output.iter_mut()) {
                 let x = u64::from(self.x) + u64::from(column) * u64::from(self.width) / u64::from(target_size.0);
                 *pixel = if x < u64::from(frame_size.0) && y < u64::from(frame_size.1) {
                     usize::try_from(y * u64::from(frame_size.0) + x)

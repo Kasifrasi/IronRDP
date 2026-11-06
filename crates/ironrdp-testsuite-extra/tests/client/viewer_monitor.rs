@@ -7,8 +7,244 @@ use ironrdp::input::MousePosition;
 use ironrdp::pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp::pdu::geometry::{ExclusiveRectangle, InclusiveRectangle};
 use ironrdp_viewer::monitor::{
-    DesktopFrame, MonitorFocusState, MonitorLayout, MonitorResizeState, MonitorViewport, OutputGeometry,
+    DesktopFrame, MonitorDamage, MonitorFocusState, MonitorLayout, MonitorResizeState, MonitorViewport, OutputGeometry,
 };
+
+// oracle: reference target resizing 100->200->100 before presentation; damage projected at the intermediate scale cannot repair the final buffer.
+#[test]
+fn damage_rendering_discards_intermediate_resize_coordinates() {
+    let mut damage = MonitorDamage::default();
+    damage.presented((100, 100));
+    damage.resize((200, 100));
+    damage.add(ExclusiveRectangle {
+        left: 150,
+        top: 0,
+        right: 152,
+        bottom: 1,
+    });
+    damage.resize((100, 100));
+
+    assert_eq!(
+        damage.repair_region(1, (100, 100)),
+        Some(ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100
+        })
+    );
+}
+
+// oracle: reference minimize/restore sequence; even without a projected patch, intermediate target geometry invalidates old presentation contents.
+#[test]
+fn damage_rendering_tracks_zero_size_before_restore() {
+    let mut damage = MonitorDamage::default();
+    damage.presented((100, 100));
+    damage.resize((0, 0));
+    damage.resize((100, 100));
+
+    assert_eq!(
+        damage.repair_region(1, (100, 100)),
+        Some(ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100
+        })
+    );
+}
+
+// oracle: reference softbuffer 0.4.8 buffer-age model; an age-2 buffer still needs the previous visible change at column 1.
+#[test]
+fn damage_rendering_repairs_an_alternating_buffer() {
+    let viewport = MonitorViewport {
+        x: 0,
+        y: 0,
+        width: 4,
+        height: 2,
+        primary: true,
+    };
+    let mut damage = MonitorDamage::default();
+    let mut frame = [1, 2, 3, 4, 5, 6, 7, 8];
+    let mut first = [0; 8];
+    let mut second = [0; 8];
+    let size = (4, 2);
+
+    assert!(viewport.render_region(
+        &frame,
+        size,
+        &mut first,
+        (4, 2),
+        &damage.repair_region(0, (4, 2)).unwrap()
+    ));
+    damage.presented((4, 2));
+
+    frame[1] = 20;
+    damage.add(ExclusiveRectangle {
+        left: 1,
+        top: 0,
+        right: 2,
+        bottom: 1,
+    });
+    assert!(viewport.render_region(
+        &frame,
+        size,
+        &mut second,
+        (4, 2),
+        &damage.repair_region(0, (4, 2)).unwrap()
+    ));
+    damage.presented((4, 2));
+
+    frame[2] = 30;
+    damage.add(ExclusiveRectangle {
+        left: 2,
+        top: 0,
+        right: 3,
+        bottom: 1,
+    });
+    let repair = damage.repair_region(2, (4, 2)).unwrap();
+    assert_eq!(
+        repair,
+        ExclusiveRectangle {
+            left: 1,
+            top: 0,
+            right: 3,
+            bottom: 1
+        }
+    );
+    assert!(viewport.render_region(&frame, size, &mut first, (4, 2), &repair));
+    assert_eq!(first, [1, 20, 30, 4, 5, 6, 7, 8]);
+}
+
+// oracle: reference softbuffer 0.4.8 buffer-age model; repaired historical pixels are not new visible damage.
+#[test]
+fn damage_history_retains_visible_changes_instead_of_accumulating_repairs() {
+    let mut damage = MonitorDamage::default();
+    damage.presented((8, 4));
+    damage.presented((8, 4));
+    damage.add(ExclusiveRectangle {
+        left: 1,
+        top: 0,
+        right: 2,
+        bottom: 1,
+    });
+    damage.presented((8, 4));
+    let current = ExclusiveRectangle {
+        left: 5,
+        top: 2,
+        right: 6,
+        bottom: 3,
+    };
+    damage.add(current.clone());
+    assert_eq!(
+        damage.repair_region(2, (8, 4)),
+        Some(ExclusiveRectangle {
+            left: 1,
+            top: 0,
+            right: 6,
+            bottom: 3
+        })
+    );
+
+    damage.presented((8, 4));
+    assert_eq!(damage.repair_region(2, (8, 4)), Some(current));
+    assert_eq!(damage.repair_region(1, (8, 4)), None);
+}
+
+// oracle: reference softbuffer 0.4.8 buffer-age model; unspecified contents or missing presentation history require the entire target.
+#[rstest::rstest]
+#[case::unknown(0)]
+#[case::older_than_history(255)]
+fn damage_rendering_repaints_unrecoverable_buffers(#[case] age: u8) {
+    let mut damage = MonitorDamage::default();
+    damage.presented((8, 4));
+    damage.add(ExclusiveRectangle {
+        left: 1,
+        top: 0,
+        right: 2,
+        bottom: 1,
+    });
+    assert_eq!(
+        damage.repair_region(age, (8, 4)),
+        Some(ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 8,
+            bottom: 4
+        })
+    );
+}
+
+// oracle: reference resized target with unspecified contents; old geometry and pending patches cannot initialize it.
+#[test]
+fn damage_invalidation_repaints_the_new_extent() {
+    let mut damage = MonitorDamage::default();
+    damage.presented((8, 4));
+    damage.add(ExclusiveRectangle {
+        left: 1,
+        top: 0,
+        right: 2,
+        bottom: 1,
+    });
+    damage.invalidate();
+    assert_eq!(
+        damage.repair_region(1, (12, 6)),
+        Some(ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 12,
+            bottom: 6
+        })
+    );
+}
+
+// oracle: reference native crop of rows [5,6,7,8] and [9,10,11,12]; only the crop's right column is repaired.
+#[test]
+fn damage_rendering_copies_native_rows_at_their_crop_origin() {
+    let viewport = MonitorViewport {
+        x: 1,
+        y: 1,
+        width: 2,
+        height: 2,
+        primary: false,
+    };
+    let mut target = [99; 4];
+    assert!(viewport.render_region(
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        (4, 3),
+        &mut target,
+        (2, 2),
+        &ExclusiveRectangle {
+            left: 1,
+            top: 0,
+            right: 2,
+            bottom: 2
+        }
+    ));
+    assert_eq!(target, [99, 7, 99, 11]);
+}
+
+// oracle: reference scale-2 grid [2,2,3,3]; repairing target [2,4) x [0,2) replaces only its four samples of source pixel 3.
+#[test]
+fn damage_rendering_preserves_pixels_outside_the_changed_region() {
+    let viewport = MonitorViewport {
+        x: 1,
+        y: 0,
+        width: 2,
+        height: 2,
+        primary: false,
+    };
+    let mut target = [99; 16];
+    let region = ExclusiveRectangle {
+        left: 2,
+        top: 0,
+        right: 4,
+        bottom: 2,
+    };
+
+    assert!(viewport.render_region(&[1, 2, 3, 4, 5, 6, 7, 8], (4, 2), &mut target, (4, 4), &region));
+    assert_eq!(target, [99, 99, 3, 3, 99, 99, 3, 3, 99, 99, 99, 99, 99, 99, 99, 99]);
+}
 
 // oracle: reference nearest-neighbor scale-2 grid; source columns 1..=2 and row 0 occupy target [2,6) x [0,2).
 #[test]
