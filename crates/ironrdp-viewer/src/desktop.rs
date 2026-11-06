@@ -14,7 +14,12 @@ use crate::rail::bounded_window_size;
 
 type Surface = softbuffer::Surface<OwnedDisplayHandle, Arc<Window>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MonitorId(usize);
+
 struct DesktopWindow {
+    monitor_id: MonitorId,
+    remote_index: usize,
     window: Arc<Window>,
     surface: Surface,
     viewport: Option<MonitorViewport>,
@@ -24,6 +29,7 @@ struct DesktopWindow {
 /// Presents a shared desktop in windows using the server's monitor definitions.
 pub(crate) struct MonitorWindows {
     windows: Vec<DesktopWindow>,
+    preferred_primary: MonitorId,
     layout: Option<MonitorLayout>,
     frame: DesktopFrame,
     awaiting_frame: bool,
@@ -35,6 +41,13 @@ pub(crate) struct MonitorWindows {
 
 impl MonitorWindows {
     pub(crate) fn prepare(&mut self, layout: MonitorLayout) {
+        self.preferred_primary = MonitorId(
+            layout
+                .monitors()
+                .iter()
+                .position(|monitor| monitor.primary)
+                .unwrap_or(0),
+        );
         self.resizes.set_layout(&layout);
         self.layout = Some(layout);
     }
@@ -43,9 +56,9 @@ impl MonitorWindows {
         if self.windows.is_empty() || self.windows.iter().any(|view| !view.presented) {
             return None;
         }
-        self.windows
-            .iter()
-            .map(|view| {
+        (0..self.windows.len())
+            .map(|index| {
+                let view = self.windows.iter().find(|view| view.remote_index == index)?;
                 let size = view.window.inner_size();
                 (size.width != 0 && size.height != 0).then_some((size.width, size.height))
             })
@@ -68,9 +81,9 @@ impl MonitorWindows {
         if let Some(layout) = &self.layout {
             self.resizes.set_layout(layout);
         }
-        for (index, view) in self.windows.iter().enumerate() {
+        for view in &self.windows {
             let size = view.window.inner_size();
-            self.resizes.resized(index, (size.width, size.height))?;
+            self.resizes.resized(view.remote_index, (size.width, size.height))?;
         }
         Ok(())
     }
@@ -83,6 +96,7 @@ impl MonitorWindows {
     pub(crate) fn new(initial_size: PhysicalSize<u32>, scale_factor: u32) -> Self {
         Self {
             windows: Vec::new(),
+            preferred_primary: MonitorId(0),
             layout: None,
             frame: DesktopFrame::default(),
             awaiting_frame: true,
@@ -113,10 +127,10 @@ impl MonitorWindows {
     }
 
     pub(crate) fn resized(&mut self, id: WindowId, size: PhysicalSize<u32>) -> anyhow::Result<bool> {
-        let Some(index) = self.windows.iter().position(|view| view.window.id() == id) else {
+        let Some(view) = self.windows.iter().find(|view| view.window.id() == id) else {
             return Ok(false);
         };
-        self.resizes.resized(index, (size.width, size.height))
+        self.resizes.resized(view.remote_index, (size.width, size.height))
     }
 
     pub(crate) fn pending_resize(&self) -> Option<&DisplayControlMonitorLayout> {
@@ -160,7 +174,8 @@ impl MonitorWindows {
             None
         } else {
             match MonitorLayout::new(monitors) {
-                Ok(layout) => {
+                Ok(mut layout) => {
+                    layout.order_horizontal();
                     info!(monitor_count = layout.monitors().len(), "Using server monitor layout");
                     Some(layout)
                 }
@@ -213,9 +228,18 @@ impl MonitorWindows {
             })],
             _ => vec![None],
         };
-        self.windows.truncate(viewports.len());
+        let ids: Vec<_> = (0..viewports.len())
+            .map(|index| {
+                if viewports.len() == 1 {
+                    self.preferred_primary
+                } else {
+                    MonitorId(index)
+                }
+            })
+            .collect();
+        self.windows.retain(|view| ids.contains(&view.monitor_id));
         self.resizes.retain_windows(viewports.len());
-        for (index, viewport) in viewports.into_iter().enumerate() {
+        for (index, (monitor_id, viewport)) in ids.into_iter().zip(viewports).enumerate() {
             let title = match viewport {
                 Some(viewport)
                     if self
@@ -225,14 +249,19 @@ impl MonitorWindows {
                 {
                     format!(
                         "IronRDP - Monitor {}{}",
-                        index + 1,
+                        monitor_id.0 + 1,
                         if viewport.primary { " (primary)" } else { "" }
                     )
                 }
                 Some(_) => "IronRDP - Combined desktop (monitor layout unavailable)".to_owned(),
                 None => "IronRDP - Waiting for monitor layout".to_owned(),
             };
-            if index == self.windows.len() {
+            if let Some(view) = self.windows.iter_mut().find(|view| view.monitor_id == monitor_id) {
+                view.remote_index = index;
+                view.viewport = viewport;
+                view.window.set_title(&title);
+                view.window.request_redraw();
+            } else {
                 let size = viewport.map_or(self.initial_size, |view| {
                     PhysicalSize::new(u32::from(view.width), u32::from(view.height))
                 });
@@ -249,16 +278,13 @@ impl MonitorWindows {
                 let surface = softbuffer::Surface::new(context, Arc::clone(&window))
                     .map_err(|error| anyhow::anyhow!("unable to create monitor surface: {error}"))?;
                 self.windows.push(DesktopWindow {
+                    monitor_id,
+                    remote_index: index,
                     window,
                     surface,
                     viewport,
                     presented: false,
                 });
-            } else {
-                let view = &mut self.windows[index];
-                view.viewport = viewport;
-                view.window.set_title(&title);
-                view.window.request_redraw();
             }
         }
         Ok(())
