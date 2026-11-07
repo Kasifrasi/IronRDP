@@ -4,6 +4,7 @@ use anyhow::Context as _;
 use ironrdp::client::rdp::DesktopUpdate;
 use ironrdp::displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp::pdu::gcc::Monitor;
+use smallvec::SmallVec;
 use tracing::{info, warn};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event_loop::{ActiveEventLoop, OwnedDisplayHandle};
@@ -458,8 +459,9 @@ impl MonitorWindows {
             .map_err(|error| anyhow::anyhow!("unable to acquire monitor buffer: {error}"))?;
         // UNTESTED: backend buffer ages must match successful presentations for partial repairs.
         // Check scrolling, occlusion, resize and reconnect on Wayland when changing this path.
-        let region = view.damage.repair_region(buffer.age(), (size.width, size.height));
-        if let Some(region) = &region {
+        let regions = view.damage.repair_regions(buffer.age(), (size.width, size.height));
+        let mut damage: SmallVec<[softbuffer::Rect; 8]> = SmallVec::new();
+        for region in regions {
             if let Some(viewport) = &view.viewport
                 && !self.awaiting_frame
             {
@@ -480,19 +482,21 @@ impl MonitorWindows {
                     buffer[start..end].fill(0);
                 }
             }
-        }
-        // UNTESTED: Wayland frame callbacks must pace redraws; check live playback and resize.
-        view.window.pre_present_notify();
-        let result = match region {
-            Some(region) => buffer.present_with_damage(&[softbuffer::Rect {
+            damage.push(softbuffer::Rect {
                 x: u32::from(region.left),
                 y: u32::from(region.top),
                 width: core::num::NonZeroU32::new(u32::from(region.right - region.left))
                     .context("empty paint width")?,
                 height: core::num::NonZeroU32::new(u32::from(region.bottom - region.top))
                     .context("empty paint height")?,
-            }]),
-            None => buffer.present(),
+            });
+        }
+        // UNTESTED: Wayland frame callbacks must pace redraws; check live playback and resize.
+        view.window.pre_present_notify();
+        let result = if damage.is_empty() {
+            buffer.present()
+        } else {
+            buffer.present_with_damage(&damage)
         };
         result
             .map_err(|error| anyhow::anyhow!("unable to present monitor buffer: {error}"))
