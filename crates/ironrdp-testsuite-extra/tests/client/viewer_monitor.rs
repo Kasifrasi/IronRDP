@@ -10,6 +10,100 @@ use ironrdp_viewer::monitor::{
     DesktopFrame, MonitorDamage, MonitorFocusState, MonitorLayout, MonitorResizeState, MonitorViewport, OutputGeometry,
 };
 
+#[test]
+fn damage_repair_keeps_separated_changes_sparse() {
+    // oracle: reference two opposite 10x10 changes cover 200 pixels, not their 100x100 bounding box.
+    let left = ExclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: 10,
+        bottom: 10,
+    };
+    let right = ExclusiveRectangle {
+        left: 90,
+        top: 90,
+        right: 100,
+        bottom: 100,
+    };
+    let mut damage = MonitorDamage::default();
+    damage.presented((100, 100));
+    damage.add(left.clone());
+    damage.add(right.clone());
+
+    let mut regions = damage.repair_regions(1, (100, 100)).to_vec();
+    regions.sort_by_key(|region| (region.top, region.left));
+
+    assert_eq!(regions, [left, right]);
+}
+
+#[test]
+fn sparse_damage_history_tracks_visible_changes_instead_of_repairs() {
+    // oracle: reference alternating buffers need the preceding presentation's changes, not its repairs.
+    let previous = [
+        ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        },
+        ExclusiveRectangle {
+            left: 7,
+            top: 7,
+            right: 8,
+            bottom: 8,
+        },
+    ];
+    let current = ExclusiveRectangle {
+        left: 3,
+        top: 3,
+        right: 4,
+        bottom: 4,
+    };
+    let mut damage = MonitorDamage::default();
+    damage.presented((8, 8));
+    damage.presented((8, 8));
+    for region in &previous {
+        damage.add(region.clone());
+    }
+    damage.presented((8, 8));
+    damage.add(current.clone());
+
+    let mut repaired = damage.repair_regions(2, (8, 8)).to_vec();
+    repaired.sort_by_key(|region| (region.top, region.left));
+    assert_eq!(repaired, [previous[0].clone(), current.clone(), previous[1].clone()]);
+
+    damage.presented((8, 8));
+    assert_eq!(damage.repair_regions(2, (8, 8)), [current]);
+    assert!(damage.repair_regions(1, (8, 8)).is_empty());
+}
+
+#[test]
+fn fragmented_damage_compaction_retains_every_changed_pixel() {
+    // oracle: reference forty changed pixels at (2n, 2n) must remain covered after compaction.
+    let mut damage = MonitorDamage::default();
+    damage.presented((80, 80));
+    for coordinate in (0..80).step_by(2) {
+        damage.add(ExclusiveRectangle {
+            left: coordinate,
+            top: coordinate,
+            right: coordinate + 1,
+            bottom: coordinate + 1,
+        });
+    }
+
+    let regions = damage.repair_regions(1, (80, 80));
+    for coordinate in (0..80).step_by(2) {
+        assert!(regions.iter().any(|region| {
+            region.left <= coordinate
+                && coordinate < region.right
+                && region.top <= coordinate
+                && coordinate < region.bottom
+        }));
+    }
+    // oracle: mutant allowing fragmented repaint work to grow beyond its region budget.
+    assert!(regions.len() <= 32);
+}
+
 // oracle: reference target resizing 100->200->100 before presentation; damage projected at the intermediate scale cannot repair the final buffer.
 #[test]
 fn damage_rendering_discards_intermediate_resize_coordinates() {

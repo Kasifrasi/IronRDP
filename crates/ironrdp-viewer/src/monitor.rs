@@ -9,9 +9,15 @@ use ironrdp::displaycontrol::pdu::{DeviceScaleFactor, DisplayControlMonitorLayou
 use ironrdp::input::MousePosition;
 use ironrdp::pdu::gcc::{ClientMonitorData, MONITOR_COUNT_MAX, Monitor, MonitorFlags};
 use ironrdp::pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
+use smallvec::SmallVec;
 
 /// Maximum memory retained for a shared desktop, matching the graphics compositor's limit.
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
+/// Bounds fragmented repaint work before falling back to a bounding rectangle.
+const MAX_DAMAGE_REGIONS: usize = 32;
+
+type DamageRegions = SmallVec<[ExclusiveRectangle; 8]>;
 
 /// Defers input release briefly so focus can transfer between monitor windows.
 #[derive(Default)]
@@ -41,24 +47,42 @@ impl MonitorFocusState {
 
 /// Accumulates target damage and repairs previously presented software buffers.
 pub struct MonitorDamage {
-    pending: Option<ExclusiveRectangle>,
-    history: VecDeque<Option<ExclusiveRectangle>>,
+    pending: DamageRegions,
+    history: VecDeque<DamageRegions>,
     invalid: bool,
     size: Option<(u32, u32)>,
+    repaired: DamageRegions,
 }
 
 impl Default for MonitorDamage {
     fn default() -> Self {
         Self {
-            pending: None,
+            pending: DamageRegions::new(),
             history: VecDeque::new(),
             invalid: true,
             size: None,
+            repaired: SmallVec::new(),
         }
     }
 }
 
 impl MonitorDamage {
+    /// Returns the target rectangles needed to repair this presentation buffer.
+    /// Keeps separated changes sparse and includes earlier presentations according to `age`.
+    pub fn repair_regions(&mut self, age: u8, size: (u32, u32)) -> &[ExclusiveRectangle] {
+        self.resize(size);
+        self.repaired.clear();
+        if self.invalid || age == 0 || self.history.len() < usize::from(age) - 1 {
+            self.repaired.extend(Self::full_region(size));
+        } else {
+            self.repaired.clone_from(&self.pending);
+            for region in self.history.iter().take(usize::from(age) - 1).flatten() {
+                add_damage(&mut self.repaired, region.clone());
+            }
+        }
+        &self.repaired
+    }
+
     /// Observes target size changes, including intermediate sizes before a redraw.
     pub fn resize(&mut self, size: (u32, u32)) {
         if self.size != Some(size) {
@@ -68,14 +92,12 @@ impl MonitorDamage {
     }
 
     pub fn add(&mut self, region: ExclusiveRectangle) {
-        self.pending = Some(match self.pending.take() {
-            Some(pending) => pending.union(&region),
-            None => region,
-        });
+        add_damage(&mut self.pending, region);
     }
 
     pub fn invalidate(&mut self) {
-        self.pending = None;
+        self.pending.clear();
+        self.repaired.clear();
         self.history.clear();
         self.invalid = true;
     }
@@ -86,30 +108,23 @@ impl MonitorDamage {
     ///
     /// [softbuffer's buffer age]: https://docs.rs/softbuffer/0.4.8/softbuffer/struct.Buffer.html#method.age
     pub fn repair_region(&mut self, age: u8, size: (u32, u32)) -> Option<ExclusiveRectangle> {
-        self.resize(size);
-        if self.invalid || age == 0 || self.history.len() < usize::from(age) - 1 {
-            return Self::full_region(size);
-        }
-        self.history
+        self.repair_regions(age, size)
             .iter()
-            .take(usize::from(age) - 1)
-            .flatten()
-            .fold(self.pending.clone(), |pending, region| {
-                Some(pending.map_or_else(|| region.clone(), |pending| pending.union(region)))
-            })
+            .cloned()
+            .reduce(|pending, region| pending.union(&region))
     }
 
     /// Records visible changes only after a successful presentation.
     pub fn presented(&mut self, size: (u32, u32)) {
         self.resize(size);
         let changed = if self.invalid {
-            Self::full_region(size)
+            Self::full_region(size).into_iter().collect()
         } else {
-            self.pending.take()
+            core::mem::take(&mut self.pending)
         };
         self.history.push_front(changed);
         self.history.truncate(8);
-        self.pending = None;
+        self.pending.clear();
         self.invalid = false;
     }
 
@@ -123,6 +138,30 @@ impl MonitorDamage {
             bottom,
         })
     }
+}
+
+fn add_damage(regions: &mut DamageRegions, mut region: ExclusiveRectangle) {
+    if !(region.left < region.right && region.top < region.bottom) {
+        return;
+    }
+    let area = |rect: &ExclusiveRectangle| u64::from(rect.right - rect.left) * u64::from(rect.bottom - rect.top);
+    let mut index = 0;
+    while index < regions.len() {
+        let merged = regions[index].union(&region);
+        // Merge only when painting the bounding box costs no more than both rectangles.
+        if area(&merged) <= area(&regions[index]) + area(&region) {
+            region = merged;
+            regions.swap_remove(index);
+            index = 0;
+        } else {
+            index += 1;
+        }
+    }
+    if regions.len() == MAX_DAMAGE_REGIONS {
+        region = regions.iter().fold(region, |region, pending| region.union(pending));
+        regions.clear();
+    }
+    regions.push(region);
 }
 
 /// A monitor's rectangle relative to the framebuffer's top-left corner.
