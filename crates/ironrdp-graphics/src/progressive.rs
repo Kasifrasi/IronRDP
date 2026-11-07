@@ -1284,7 +1284,8 @@ fn charge_region_clipping_work(used: &mut usize, units: usize) -> Result<(), Pro
 /// ```
 pub struct ProgressiveDecoder {
     surfaces: BTreeMap<u16, SurfaceTiles>,
-    references: BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
+    // Keep large coefficient arrays out of map nodes so rebalancing moves only their owners.
+    references: BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
     frame_tiles: BTreeMap<u16, BTreeSet<(u16, u16)>>,
     frame_active: bool,
 }
@@ -1555,7 +1556,7 @@ const PARALLEL_MIN_TILES: usize = 8;
 fn decode_tile_blocks(
     surface_id: u16,
     surface: &mut SurfaceTiles,
-    references: &mut BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
+    references: &mut BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
     tile_blocks: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>],
     quant_vals: &[ComponentCodecQuant],
     prog_quant_vals: &[ProgressiveCodecQuant],
@@ -1626,7 +1627,7 @@ fn decode_tile_blocks(
 #[cfg(feature = "rayon")]
 fn lacks_reference(
     surface_id: u16,
-    references: &BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
+    references: &BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
     tile_blocks: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>],
 ) -> bool {
     use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
@@ -1646,7 +1647,7 @@ fn lacks_reference(
 fn decode_tile_blocks_parallel(
     surface_id: u16,
     surface: &mut SurfaceTiles,
-    references: &mut BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
+    references: &mut BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
     tile_blocks: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>],
     indices: &[usize],
     quant_vals: &[ComponentCodecQuant],
@@ -1656,11 +1657,11 @@ fn decode_tile_blocks_parallel(
 ) -> Result<(), ProgressiveDecodeError> {
     use rayon::prelude::*;
 
-    // UNTESTED: Restore every tile's state and reference before returning, including on errors,
-    // so subsequent frames retain their decoding history.
-    // Compare tile pixels, block order, and references with sequential decoding when changing this path.
+    // UNTESTED: Failed regions mixing new and existing tiles must restore every state and
+    // reference so subsequent frames retain their decoding history.
+    // Check mixed tile lifetimes and error recovery when changing this path.
     // Take each tile's state and reference out, decode on the pool, put them back.
-    let mut work: Vec<(Box<TileState>, Option<DecDwtQ>, bool)> = tile_blocks
+    let mut work: Vec<(Box<TileState>, Option<Box<DecDwtQ>>, bool)> = tile_blocks
         .iter()
         .zip(indices)
         .map(|(block, &index)| {
@@ -1718,7 +1719,7 @@ fn decode_tile_blocks_parallel(
 )]
 fn decode_tile(
     tile_state: &mut TileState,
-    reference: &mut Option<DecDwtQ>,
+    reference: &mut Option<Box<DecDwtQ>>,
     tile_block: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>,
     quant_vals: &[ComponentCodecQuant],
     prog_quant_vals: &[ProgressiveCodecQuant],
@@ -1735,7 +1736,7 @@ fn decode_tile(
             let difference_reference = if is_difference {
                 Some(
                     reference
-                        .as_ref()
+                        .as_deref()
                         .ok_or(ProgressiveDecodeError::MissingTileReference { x_idx, y_idx })?,
                 )
             } else {
@@ -1767,7 +1768,7 @@ fn decode_tile(
                     use_reduce_extrapolate,
                 },
             )?;
-            *reference = Some(tile_state.coefficients);
+            update_reference(reference, &tile_state.coefficients);
 
             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
             tile_state.reconstruct_to_rgba(&mut pixels);
@@ -1788,7 +1789,7 @@ fn decode_tile(
             let difference_reference = if is_difference {
                 Some(
                     reference
-                        .as_ref()
+                        .as_deref()
                         .ok_or(ProgressiveDecodeError::MissingTileReference { x_idx, y_idx })?,
                 )
             } else {
@@ -1819,7 +1820,7 @@ fn decode_tile(
                     use_reduce_extrapolate,
                 },
             )?;
-            *reference = Some(tile_state.coefficients);
+            update_reference(reference, &tile_state.coefficients);
 
             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
             tile_state.reconstruct_to_rgba(&mut pixels);
@@ -1849,7 +1850,7 @@ fn decode_tile(
                 [pq.y_quant, pq.cb_quant, pq.cr_quant],
                 tile.quality,
             )?;
-            *reference = Some(tile_state.coefficients);
+            update_reference(reference, &tile_state.coefficients);
 
             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
             tile_state.reconstruct_to_rgba(&mut pixels);
@@ -1861,6 +1862,15 @@ fn decode_tile(
                 update_rectangles: Vec::new(),
             }])
         }
+    }
+}
+
+fn update_reference(reference: &mut Option<Box<DecDwtQ>>, coefficients: &DecDwtQ) {
+    // UNTESTED: Reuse each reference allocation to avoid per-tile heap churn during updates.
+    // Check allocation counts when changing this path.
+    match reference {
+        Some(reference) => **reference = *coefficients,
+        None => *reference = Some(Box::new(*coefficients)),
     }
 }
 
@@ -2317,14 +2327,14 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(decoder.surfaces.len(), 1);
         assert_eq!(decoder.references.len(), 1);
-        let reference = *decoder
+        let reference = **decoder
             .references
             .get(&(1, 0, 0))
             .expect("original tile reference should be retained");
 
         decoder.reset();
         assert!(decoder.surfaces.is_empty());
-        assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&reference));
+        assert_eq!(decoder.references.get(&(1, 0, 0)).map(Box::as_ref), Some(&reference));
 
         assert!(
             decoder
@@ -3759,7 +3769,7 @@ mod tests {
                 &first_tile_stream(0, &original_data, base_quant, progressive_quant, true),
             )
             .expect("original first-pass tile should decode");
-        let initial_reference = *decoder
+        let initial_reference = **decoder
             .references
             .get(&(1, 0, 0))
             .expect("original tile should retain a reference");
@@ -3779,7 +3789,7 @@ mod tests {
                 ),
             )
             .expect("upgrade tile should decode");
-        let upgraded_reference = *decoder
+        let upgraded_reference = **decoder
             .references
             .get(&(1, 0, 0))
             .expect("upgrade should update the retained reference");
@@ -3870,7 +3880,7 @@ mod tests {
                     &first_tile_stream(0, &first_data, base_quant, progressive_quant, true),
                 )
                 .expect("first-pass tile should decode");
-            let first_reference = *decoder
+            let first_reference = **decoder
                 .references
                 .get(&(1, 0, 0))
                 .expect("first-pass tile should retain a reference");
@@ -3930,7 +3940,7 @@ mod tests {
         decoder
             .decode_bitmap(1, 7, 64, 64, &simple_tile_stream(0, original_components, true))
             .expect("original tile should decode");
-        let reference = *decoder
+        let reference = **decoder
             .references
             .get(&(1, 0, 0))
             .expect("original tile reference should be retained");
@@ -3967,7 +3977,7 @@ mod tests {
             }
         }
 
-        assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&updated));
+        assert_eq!(decoder.references.get(&(1, 0, 0)).map(Box::as_ref), Some(&updated));
 
         decoder.delete_surface(1);
         assert!(!decoder.references.contains_key(&(1, 0, 0)));
@@ -3992,7 +4002,7 @@ mod tests {
         decoder
             .decode_bitmap(1, 7, 64, 64, &simple_tile_stream(0, original_components, true))
             .expect("original tile should decode");
-        let reference = *decoder
+        let reference = **decoder
             .references
             .get(&(1, 0, 0))
             .expect("original tile reference should be retained");
@@ -4000,7 +4010,7 @@ mod tests {
         decoder
             .decode_bitmap(1, 7, 128, 64, &minimal_progressive_stream(true))
             .expect("resized surface should decode");
-        assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&reference));
+        assert_eq!(decoder.references.get(&(1, 0, 0)).map(Box::as_ref), Some(&reference));
 
         decoder
             .decode_bitmap(
