@@ -260,6 +260,10 @@ pub struct BitmapUpdate {
 /// All methods have default no-op implementations so you only need
 /// to override the ones relevant to your use case.
 pub trait GraphicsPipelineHandler: Send {
+    /// Called with the original decompressed message before its PDUs are decoded.
+    /// Observers must not change the bytes or use this callback to send protocol replies.
+    fn on_message_received(&mut self, _message: &[u8]) {}
+
     /// Returns the capability sets to advertise to the server
     ///
     /// The default advertises every version from 10.7 down to 10 with AVC444, then V8.1
@@ -735,6 +739,8 @@ impl GraphicsPipelineClient {
         self.decompressor
             .decompress(payload, &mut self.decompressed_buffer)
             .map_err(|e| decode_err!(e))?;
+
+        self.handler.on_message_received(&self.decompressed_buffer);
 
         // Decode all PDUs before dispatch while the cursor borrows the buffer.
         let mut pdus = Vec::new();
