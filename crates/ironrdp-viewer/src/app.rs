@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use ironrdp::client::rail::RailInputEvent;
 use ironrdp::client::rdp::{
-    AutoReconnectDecision, RDPEI_MAX_TOUCH_CONTACTS, RdpInputEvent, RdpInputSender, RdpOutputEvent,
+    AutoReconnectDecision, DesktopUpdateBatch, RDPEI_MAX_TOUCH_CONTACTS, RdpInputEvent, RdpInputSender, RdpOutputEvent,
 };
 use ironrdp::rdpei::RdpeiInputState;
 use ironrdp::rdpei::contact::{TouchFrameBuilder, TouchPhase};
@@ -25,7 +25,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Cursor, CursorIcon, CustomCursor, Window, WindowAttributes};
 
 use crate::desktop::MonitorWindows;
-use crate::events::OutputEvent;
+use crate::events::{OutputEvent, OutputEventBatch};
 use crate::keymap::{is_modifier, map_key_code};
 use crate::monitor::MonitorFocusState;
 use crate::rail::{RailWindows, bounded_window_size, window_point_to_desktop};
@@ -60,6 +60,7 @@ pub struct App {
     inner: RpcApp,
     #[cfg(target_os = "macos")]
     clipboard: Option<ironrdp_cliprdr_native::MacClipboard>,
+    pending_desktop_updates: DesktopUpdateBatch,
 }
 
 /// A viewer application driven by a viewer-hosted RPC daemon.
@@ -122,6 +123,7 @@ impl App {
         );
         Ok(Self {
             inner,
+            pending_desktop_updates: DesktopUpdateBatch::default(),
             #[cfg(target_os = "macos")]
             clipboard: None,
         })
@@ -153,6 +155,7 @@ impl App {
             inner,
             #[cfg(target_os = "macos")]
             clipboard: None,
+            pending_desktop_updates: DesktopUpdateBatch::default(),
         }
     }
 }
@@ -1220,7 +1223,18 @@ impl ApplicationHandler<OutputEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: OutputEvent) {
-        self.inner.handle_output_event(event_loop, event.event);
+        match event.into_batch(&mut self.pending_desktop_updates) {
+            Some(OutputEventBatch::DesktopUpdates(updates)) => {
+                // UNTESTED: apply every patch before returning to winit so exposes cannot present a batch prefix.
+                // Check redraw and expose handling when changing this loop.
+                for update in updates {
+                    self.inner
+                        .handle_output_event(event_loop, RdpOutputEvent::DesktopUpdate(update));
+                }
+            }
+            Some(OutputEventBatch::Event(event)) => self.inner.handle_output_event(event_loop, event),
+            None => {}
+        }
     }
 }
 
