@@ -19,6 +19,7 @@ pub mod config;
 pub mod egfx_cache;
 #[cfg(feature = "entra-auth")]
 pub mod entra;
+pub mod graphics_capture;
 pub mod h264;
 #[cfg(feature = "entra-auth")]
 pub mod interactive_entra;

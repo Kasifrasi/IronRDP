@@ -2473,8 +2473,23 @@ fn build_connector(
     // only when it returns YUV planes. The decoder starts during the connection sequence
     // and is awaited when the graphics channel opens, so a slow start does not delay
     // connecting.
-    struct EgfxHandler;
-    impl GraphicsPipelineHandler for EgfxHandler {}
+    struct EgfxHandler {
+        capture: Option<crate::graphics_capture::Recorder>,
+    }
+    impl GraphicsPipelineHandler for EgfxHandler {
+        fn on_message_received(&mut self, message: &[u8]) {
+            if let Some(capture) = &mut self.capture
+                && let Err(error) = capture.record(message)
+            {
+                warn!(%error, "Unable to record graphics message");
+                self.capture = None;
+            }
+        }
+
+        fn on_close(&mut self) {
+            self.capture = None;
+        }
+    }
 
     let h264_decoders = config
         .channels
@@ -2492,7 +2507,12 @@ fn build_connector(
             RdpInputProtocolVersion::V300,
         ))
         .with_dynamic_channel({
-            let mut egfx = GraphicsPipelineClient::new(Box::new(EgfxHandler), h264_decoder);
+            let mut egfx = GraphicsPipelineClient::new(
+                Box::new(EgfxHandler {
+                    capture: crate::graphics_capture::Recorder::from_env(),
+                }),
+                h264_decoder,
+            );
             if let Some(decoders) = h264_decoders.cloned() {
                 egfx = egfx.with_h264_decoder_factory(Box::new(move || decoders.create()));
             }
