@@ -764,47 +764,43 @@ impl RawBitWriter {
 /// for the missing positions, matching the FreeRDP reference implementation's
 /// tolerance for short truncation in this exact upgrade path.
 ///
-/// Callers are expected to pass `count <= 32` to [`read_bits`](Self::read_bits);
-/// the upgrade-pass call site bounds `count` by `prev_bit_pos - curr_bit_pos`
-/// which is at most a few bits in practice.
+/// Wider reads retain their low 32 bits for public quantization values
+/// outside the on-wire four-bit range.
 struct RawBitReader<'a> {
     data: &'a [u8],
-    byte_idx: usize,
-    bit_idx: u8,
+    buffered: u64,
+    buffered_bits: u32,
 }
 
 impl<'a> RawBitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self {
             data,
-            byte_idx: 0,
-            bit_idx: 0,
+            buffered: 0,
+            buffered_bits: 0,
         }
     }
 
     /// Read `count` bits MSB-first into a `u32`. Bits past the end of the
     /// underlying stream read as zero.
     fn read_bits(&mut self, count: u32) -> u32 {
-        let mut value = 0u32;
-        for _ in 0..count {
-            value = (value << 1) | u32::from(self.read_bit());
+        while self.buffered_bits < count {
+            let Some((&byte, remaining)) = self.data.split_first() else {
+                let padding = count - self.buffered_bits;
+                let value = if padding < 32 { self.buffered << padding } else { 0 };
+                self.buffered = 0;
+                self.buffered_bits = 0;
+                return u32::try_from(value & u64::from(u32::MAX)).expect("masked to 32 bits");
+            };
+            self.data = remaining;
+            self.buffered = (self.buffered << 8) | u64::from(byte);
+            self.buffered_bits += 8;
         }
-        value
-    }
 
-    /// Read one bit. Returns `false` past end-of-stream by design (see
-    /// type-level docs).
-    fn read_bit(&mut self) -> bool {
-        if self.byte_idx >= self.data.len() {
-            return false;
-        }
-        let bit = (self.data[self.byte_idx] >> (7 - self.bit_idx)) & 1 != 0;
-        self.bit_idx += 1;
-        if self.bit_idx >= 8 {
-            self.bit_idx = 0;
-            self.byte_idx += 1;
-        }
-        bit
+        self.buffered_bits -= count;
+        let value = (self.buffered >> self.buffered_bits) & ((1u64 << count.min(32)) - 1);
+        self.buffered &= (1u64 << self.buffered_bits) - 1;
+        u32::try_from(value).expect("masked to 32 bits")
     }
 }
 
