@@ -169,10 +169,8 @@ fn decode_block(buffer: &mut [i16], temp: &mut [i16], n_l: usize, n_h: usize) {
         );
     }
 
-    // Vertical inverse: (L + H) -> reconstructed columns in buffer
-    for col in 0..dst_w {
-        idwt_col(temp, l_off + col, h_off + col, dst_w, buffer, col, dst_w, n_l, n_h);
-    }
+    // Vertical inverse: (L + H) -> reconstructed rows in buffer.
+    idwt_vertical(temp, buffer, n_l, n_h);
 }
 
 /// 1D inverse DWT on a contiguous row.
@@ -220,64 +218,65 @@ fn idwt_row(low: &[i16], high: &[i16], dst: &mut [i16]) {
     }
 }
 
-/// 1D inverse DWT on a strided column.
-///
-/// Reads from `src` with stride, writes to `dst` with stride.
-#[expect(clippy::too_many_arguments)]
-fn idwt_col(
-    src: &[i16],
-    l_start: usize,
-    h_start: usize,
-    src_stride: usize,
-    dst: &mut [i16],
-    d_start: usize,
-    dst_stride: usize,
-    n_l: usize,
-    n_h: usize,
-) {
-    let l = |i: usize| i32::from(src[l_start + i * src_stride]);
-    let h = |i: usize| i32::from(src[h_start + i * src_stride]);
+/// Inverse DWT across all columns of a reduce-extrapolate level.
+fn idwt_vertical(src: &[i16], dst: &mut [i16], n_l: usize, n_h: usize) {
+    let width = n_l + n_h;
+    let (low, high) = src.split_at(n_l * width);
 
-    let mut h0 = h(0);
-    let mut x0 = t(l(0) - h0);
-    let mut x2 = x0;
-
-    let mut d = d_start;
-
-    for j in 0..n_h - 1 {
-        let h1 = h(j + 1);
-        x2 = t(l(j + 1) - (h0 + h1) / 2);
-        let x1 = t((i32::from(x0) + i32::from(x2)) / 2 + 2 * h0);
-        dst[d] = x0;
-        d += dst_stride;
-        dst[d] = x1;
-        d += dst_stride;
-        x0 = x2;
-        h0 = h1;
+    // UNTESTED: Contiguous row traversal must let release builds vectorize independent columns.
+    // Check the generated code when changing these loops.
+    for ((output, &low), &high) in dst[..width].iter_mut().zip(low).zip(high) {
+        *output = t(i32::from(low) - i32::from(high));
+    }
+    for row in 1..n_h {
+        let low = &low[row * width..];
+        let previous_high = &high[(row - 1) * width..];
+        let current_high = &high[row * width..];
+        for ((output, &low), (&previous, &current)) in dst[2 * row * width..][..width]
+            .iter_mut()
+            .zip(low)
+            .zip(previous_high.iter().zip(current_high))
+        {
+            *output = t(i32::from(low) - (i32::from(previous) + i32::from(current)) / 2);
+        }
     }
 
-    if n_l <= n_h + 1 {
-        if n_l <= n_h {
-            dst[d] = x2;
-            d += dst_stride;
-            dst[d] = t(i32::from(x2) + 2 * h0);
+    // The three levels have one or two more low-pass rows than high-pass rows.
+    for ((output, &low), &high) in dst[2 * n_h * width..][..width]
+        .iter_mut()
+        .zip(&low[n_h * width..])
+        .zip(&high[(n_h - 1) * width..])
+    {
+        let high = if n_l == n_h + 1 {
+            i32::from(high)
         } else {
-            let x_new = t(l(n_h) - h0);
-            dst[d] = x2;
-            d += dst_stride;
-            dst[d] = t((i32::from(x_new) + i32::from(x2)) / 2 + 2 * h0);
-            d += dst_stride;
-            dst[d] = x_new;
+            i32::from(high) / 2
+        };
+        *output = t(i32::from(low) - high);
+    }
+
+    for row in 0..n_h {
+        let (previous, remaining) = dst.split_at_mut((2 * row + 1) * width);
+        let previous = &previous[previous.len() - width..];
+        let (output, next) = remaining.split_at_mut(width);
+        for ((output, (&previous, &next)), &high) in output
+            .iter_mut()
+            .zip(previous.iter().zip(&next[..width]))
+            .zip(&high[row * width..])
+        {
+            *output = t((i32::from(previous) + i32::from(next)) / 2 + 2 * i32::from(high));
         }
-    } else {
-        let x_new = t(l(n_h) - h0 / 2);
-        dst[d] = x2;
-        d += dst_stride;
-        dst[d] = t((i32::from(x_new) + i32::from(x2)) / 2 + 2 * h0);
-        d += dst_stride;
-        dst[d] = x_new;
-        d += dst_stride;
-        dst[d] = t((i32::from(x_new) + l(n_h + 1)) / 2);
+    }
+
+    if n_l == n_h + 2 {
+        let (previous, last) = dst.split_at_mut((width - 1) * width);
+        for ((output, &previous), &low) in last[..width]
+            .iter_mut()
+            .zip(&previous[(width - 2) * width..])
+            .zip(&low[(n_l - 1) * width..])
+        {
+            *output = t((i32::from(previous) + i32::from(low)) / 2);
+        }
     }
 }
 
