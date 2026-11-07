@@ -775,6 +775,222 @@ fn client_skips_avc420_without_decoder() {
         .expect("should succeed without decoder");
 }
 
+fn padded_yuv420_picture(neutral_chroma: bool) -> Yuv420Frame {
+    let y = vec![
+        40, 41, 42, 43, 44, 255, 255, 255, 47, 48, 49, 50, 51, 255, 255, 255, 54, 55, 56, 57, 58, 255, 255, 255, 61,
+        62, 63, 64, 65, 255, 255, 255, 68, 69, 70, 71, 72, 255, 255, 255,
+    ];
+    let (u, v) = if neutral_chroma {
+        (vec![128; 15], vec![128; 15])
+    } else {
+        (
+            vec![128, 144, 112, 0, 0, 160, 96, 128, 0, 0, 80, 176, 128, 0, 0],
+            vec![128, 112, 144, 255, 255, 144, 160, 96, 255, 255, 176, 80, 128, 255, 255],
+        )
+    };
+    Yuv420Frame::new(5, 5, y, 8, u, v, 5).unwrap()
+}
+
+fn capture_yuv420_regions(
+    picture: Yuv420Frame,
+    surface: (u16, u16),
+    destination_rectangle: ExclusiveRectangle,
+    regions: &[Avc420Region],
+) -> Vec<(ExclusiveRectangle, Vec<u8>)> {
+    struct PlaneDecoder(Option<Yuv420Frame>);
+    impl H264Decoder for PlaneDecoder {
+        fn decode(&mut self, _data: &[u8]) -> DecoderResult<DecodedFrame> {
+            panic!("a plane decoder must use decode_yuv420");
+        }
+
+        fn decode_yuv420(&mut self, _data: &[u8]) -> DecoderResult<Yuv420Frame> {
+            Ok(self.0.take().expect("one picture"))
+        }
+
+        fn supports_yuv420(&self) -> bool {
+            true
+        }
+    }
+
+    struct Capture(Arc<Mutex<Vec<(ExclusiveRectangle, Vec<u8>)>>>);
+    impl GraphicsPipelineHandler for Capture {
+        fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((update.destination_rectangle.clone(), update.data.clone()));
+        }
+    }
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut client = GraphicsPipelineClient::new(
+        Box::new(Capture(Arc::clone(&captured))),
+        Some(Box::new(PlaneDecoder(Some(picture)))),
+    );
+    send_all(&mut client, &[v107_confirm(), create_surface(1, surface.0, surface.1)]);
+    send_all(
+        &mut client,
+        &[GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id: 1,
+            codec_id: Codec1Type::Avc420,
+            pixel_format: PixelFormat::XRgb,
+            destination_rectangle,
+            bitmap_data: encode_avc420_bitmap_stream(regions, &[1]),
+        })],
+    );
+    let updates = captured.lock().unwrap().clone();
+    updates
+}
+
+// oracle: spec MS-RDPEGFX §3.3.8.3.1, independently calculated reverse-matrix RGB values.
+// oracle: mutant resetting chroma phase at an odd crop origin, ignoring plane strides, or changing opaque alpha.
+#[test]
+fn avc420_yuv_regions_preserve_absolute_chroma_phase_and_padded_rows() {
+    let rectangle = ExclusiveRectangle {
+        left: 1,
+        top: 1,
+        right: 5,
+        bottom: 5,
+    };
+    let updates = capture_yuv420_regions(
+        padded_yuv420_picture(false),
+        (5, 5),
+        rectangle.clone(),
+        &[Avc420Region::new(1, 1, 5, 5, 22, 100)],
+    );
+    let rgb = [
+        [48, 48, 48],
+        [23, 53, 78],
+        [24, 54, 79],
+        [76, 46, 21],
+        [80, 41, 114],
+        [106, 47, 0],
+        [107, 48, 0],
+        [7, 73, 58],
+        [87, 48, 121],
+        [113, 54, 3],
+        [114, 55, 4],
+        [14, 80, 65],
+        [144, 55, 0],
+        [0, 83, 159],
+        [0, 84, 160],
+        [72, 72, 72],
+    ];
+    let expected: Vec<u8> = rgb.into_iter().flat_map(|[r, g, b]| [r, g, b, 255]).collect();
+    assert_eq!(updates, vec![(rectangle, expected)]);
+}
+
+// oracle: spec MS-RDPEGFX §2.2.1.2 and §2.2.4.4.1, exclusive surface coordinates and region mask.
+// oracle: mutant losing surface/frame clipping, duplicate callbacks, or unchanged source pixels in overlapping metadata.
+#[test]
+fn avc420_yuv_regions_clip_before_conversion_and_preserve_overlaps() {
+    let rectangle = ExclusiveRectangle {
+        left: 1,
+        top: 1,
+        right: 5,
+        bottom: 5,
+    };
+    let updates = capture_yuv420_regions(
+        padded_yuv420_picture(true),
+        (4, 6),
+        rectangle,
+        &[
+            Avc420Region::new(1, 1, 4, 4, 22, 100),
+            Avc420Region::new(3, 2, 7, 7, 22, 100),
+            Avc420Region::new(1, 1, 4, 4, 22, 100),
+            Avc420Region::new(4, 0, 4, 2, 22, 100),
+            Avc420Region::new(9, 1, 10, 3, 22, 100),
+        ],
+    );
+    let first: Vec<u8> = [48, 49, 50, 55, 56, 57, 62, 63, 64]
+        .into_iter()
+        .flat_map(|y| [y, y, y, 255])
+        .collect();
+    let second: Vec<u8> = [57, 64, 71].into_iter().flat_map(|y| [y, y, y, 255]).collect();
+    let first_rect = ExclusiveRectangle {
+        left: 1,
+        top: 1,
+        right: 4,
+        bottom: 4,
+    };
+    assert_eq!(
+        updates,
+        vec![
+            (first_rect.clone(), first.clone()),
+            (
+                ExclusiveRectangle {
+                    left: 3,
+                    top: 2,
+                    right: 4,
+                    bottom: 5
+                },
+                second
+            ),
+            (first_rect, first),
+        ]
+    );
+}
+
+// oracle: mutant replacing the empty-metadata frame-origin fallback with absolute destination coordinates.
+#[test]
+fn avc420_yuv_empty_metadata_retains_frame_origin_fallback() {
+    let rectangle = ExclusiveRectangle {
+        left: 3,
+        top: 2,
+        right: 5,
+        bottom: 4,
+    };
+    let updates = capture_yuv420_regions(padded_yuv420_picture(false), (5, 5), rectangle.clone(), &[]);
+    let expected: Vec<u8> = [40, 41, 47, 48].into_iter().flat_map(|y| [y, y, y, 255]).collect();
+    assert_eq!(updates, vec![(rectangle, expected)]);
+}
+
+// oracle: mutant treating nonempty metadata that clips away as omitted metadata.
+#[test]
+fn avc420_yuv_invalid_regions_emit_no_fallback() {
+    let rectangle = ExclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: 5,
+        bottom: 5,
+    };
+    let updates = capture_yuv420_regions(
+        padded_yuv420_picture(false),
+        (5, 5),
+        rectangle,
+        &[Avc420Region::new(9, 1, 10, 3, 22, 100)],
+    );
+    assert!(updates.is_empty());
+}
+
+// oracle: spec MS-RDPEGFX §3.3.8.3.1, neutral chroma preserves each luma value.
+// oracle: mutant losing repeated full-picture updates when their metadata overlaps.
+#[test]
+fn avc420_yuv_repeated_full_masks_keep_each_update() {
+    let rectangle = ExclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: 5,
+        bottom: 5,
+    };
+    let updates = capture_yuv420_regions(
+        padded_yuv420_picture(true),
+        (5, 5),
+        rectangle.clone(),
+        &[Avc420Region::full_frame(5, 5, 22), Avc420Region::full_frame(5, 5, 22)],
+    );
+    let expected: Vec<u8> = [
+        40, 41, 42, 43, 44, 47, 48, 49, 50, 51, 54, 55, 56, 57, 58, 61, 62, 63, 64, 65, 68, 69, 70, 71, 72,
+    ]
+    .into_iter()
+    .flat_map(|y| [y, y, y, 255])
+    .collect();
+    assert_eq!(
+        updates,
+        vec![(rectangle.clone(), expected.clone()), (rectangle, expected)]
+    );
+}
+
 // ============================================================================
 // Tests: One H.264 Decoder per Surface
 // ============================================================================
