@@ -262,11 +262,14 @@ Hyper-V VM console front-end implementing the PCB → TLS → CredSSP → X.224 
 This crate is an **API Boundary**, exposed directly through the `ironrdp` meta crate's optional
 `vmconnect` feature and integrated into `ironrdp-client` through its optional `vmconnect` feature.
 
+#### [`crates/ironrdp-viewer-sdl`](./crates/ironrdp-viewer-sdl)
+
+SDL3 video viewer using `ironrdp-client`, with one window per remote monitor and persistent textures for dirty-region rendering.
+
 #### [`crates/ironrdp-viewer`](./crates/ironrdp-viewer)
 
-Portable RDP client binary without GPU acceleration. A thin wrapper around `ironrdp-client`
-that adds the winit/softbuffer GUI event loop, the clap CLI, the inquire prompts and the
-`.rdp` file / PropertySet plumbing.
+RDP client binary with Vulkan desktop presentation on Linux/Wayland and a software rendering fallback.
+It wraps `ironrdp-client` with a winit event loop, multi-monitor windows, a clap CLI, interactive prompts, and `.rdp` file / PropertySet configuration.
 
 #### [`crates/ironrdp-daemon`](./crates/ironrdp-daemon)
 

@@ -1,0 +1,47 @@
+[package]
+name = "ironrdp-viewer-sdl"
+version = "0.0.0"
+publish = false
+readme = "README.md"
+description = "SDL3 RDP video viewer with one window per remote monitor"
+rust-version = "1.94"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+doctest = false
+test = false
+
+[[bin]]
+name = "ironrdp-viewer-sdl"
+test = false
+
+[features]
+default = ["rustls"]
+rustls = ["ironrdp-client/rustls"]
+native-tls = ["ironrdp-client/native-tls"]
+openh264 = ["ironrdp-client/openh264"]
+
+[dependencies]
+anyhow = "1" # public
+bytemuck = "1"
+clap = { version = "4.6", features = ["derive", "env"] }
+inquire = "0.9"
+ironrdp-client = { path = "../ironrdp-client", version = "0.1", features = ["video"] } # public
+ironrdp-displaycontrol = { path = "../ironrdp-displaycontrol", version = "0.10" } # public
+ironrdp-egfx = { path = "../ironrdp-egfx", version = "0.5" } # public
+ironrdp-input = { path = "../ironrdp-input", version = "0.9" } # public
+ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.11" } # public
+ironrdp-tls = { path = "../ironrdp-tls", version = "0.3" }
+sdl3 = { version = "0.22", features = ["use-pkg-config"] } # public
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true
