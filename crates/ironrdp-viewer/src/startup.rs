@@ -2,7 +2,7 @@ use core::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context as _;
-use ironrdp::client::rdp::{RdpInputSender, RdpOutputEvent};
+use ironrdp::client::rdp::RdpInputSender;
 use raw_window_handle::{HasDisplayHandle as _, RawDisplayHandle};
 use tracing::{debug, error};
 use winit::application::ApplicationHandler;
@@ -14,6 +14,7 @@ use winit::window::WindowId;
 use crate::app::{App, create_context};
 use crate::cli::{DesktopOptions, MonitorLayoutMode};
 use crate::desktop::MonitorWindows;
+use crate::events::OutputEvent;
 use crate::monitor::MonitorLayout;
 
 type Connect<'a> = Box<dyn FnOnce(&MonitorLayout, u32) -> anyhow::Result<DesktopConnection> + 'a>;
@@ -47,7 +48,7 @@ struct PreparingDesktop<'a> {
 
 impl<'a> WindowedApp<'a> {
     pub fn new(
-        event_loop: &EventLoop<RdpOutputEvent>,
+        event_loop: &EventLoop<OutputEvent>,
         options: DesktopOptions,
         connect: Connect<'a>,
     ) -> anyhow::Result<Self> {
@@ -136,7 +137,7 @@ impl<'a> WindowedApp<'a> {
     }
 }
 
-impl ApplicationHandler<RdpOutputEvent> for WindowedApp<'_> {
+impl ApplicationHandler<OutputEvent> for WindowedApp<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         match &mut self.state {
             State::Preparing(desktop) => {
@@ -252,7 +253,7 @@ impl ApplicationHandler<RdpOutputEvent> for WindowedApp<'_> {
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: RdpOutputEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: OutputEvent) {
         if let State::Running(app) = &mut self.state {
             app.user_event(event_loop, event);
         }
