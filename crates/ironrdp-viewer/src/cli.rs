@@ -104,11 +104,23 @@ pub enum MonitorLayoutMode {
     Horizontal,
 }
 
+/// Presentation backend for native desktop windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RendererKind {
+    /// Present persistent desktop textures with Vulkan.
+    Wgpu,
+    /// Present CPU-rendered window buffers.
+    Softbuffer,
+}
+
 /// Devolutions IronRDP viewer
 #[derive(Parser, Debug)]
 #[clap(author = "Devolutions", about = "Devolutions-IronRDP viewer")]
 #[clap(version, long_about = None)]
 struct Args {
+    /// Native desktop renderer; RemoteApp and RPC windows retain software presentation.
+    #[clap(long, value_enum, default_value_t = RendererKind::Wgpu)]
+    renderer: RendererKind,
     /// A file with IronRDP viewer logs
     #[clap(short, long, value_parser)]
     log_file: Option<String>,
@@ -671,6 +683,7 @@ pub struct ViewerConfig {
 /// Preferred window geometry and optional explicit desktop scaling.
 #[derive(Clone)]
 pub struct DesktopOptions {
+    pub renderer: RendererKind,
     pub layout: crate::monitor::MonitorLayout,
     pub scale_factor: Option<u32>,
     pub selection: Option<crate::outputs::MonitorSelection>,
@@ -900,6 +913,7 @@ impl ViewerConfig {
                 |(_, layout)| layout.monitors.clone(),
             );
             Some(DesktopOptions {
+                renderer: args.renderer,
                 layout: crate::monitor::MonitorLayout::new(&monitors)?,
                 scale_factor: args
                     .scale_desktop

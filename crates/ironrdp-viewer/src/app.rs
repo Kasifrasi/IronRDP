@@ -139,7 +139,6 @@ impl App {
         windows: MonitorWindows,
         input_event_sender: RdpInputSender,
         initial_size: PhysicalSize<u32>,
-        multiple_monitors: bool,
     ) -> Self {
         let mut inner = RpcApp::new_inner(
             context,
@@ -148,13 +147,7 @@ impl App {
             initial_size,
             false,
         );
-        if multiple_monitors {
-            inner.monitor_windows = Some(windows);
-        } else {
-            let surface = windows.into_single_window();
-            inner.last_window_size = Some(surface.0.inner_size());
-            inner.window = Some(surface);
-        }
+        inner.monitor_windows = Some(windows);
         Self {
             inner,
             #[cfg(target_os = "macos")]
@@ -827,6 +820,15 @@ impl RpcApp {
                 }
             }
             WindowEvent::Focused(focused) => self.monitor_focus.set_focused(Instant::now(), focused),
+            WindowEvent::Occluded(false) => {
+                if let Some(window) = self
+                    .monitor_windows
+                    .as_ref()
+                    .and_then(|monitors| monitors.window(window_id))
+                {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::Touch(touch) => {
                 self.send_pending_rail_input();
                 if let Some(position) = self

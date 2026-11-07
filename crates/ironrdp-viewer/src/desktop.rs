@@ -10,12 +10,18 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event_loop::{ActiveEventLoop, OwnedDisplayHandle};
 use winit::window::{Cursor, Fullscreen, Window, WindowAttributes, WindowId};
 
-use crate::cli::MonitorLayoutMode;
+use crate::cli::{MonitorLayoutMode, RendererKind};
+use crate::gpu::{GpuDesktop, GpuSurface};
 use crate::monitor::{DesktopFrame, MonitorDamage, MonitorLayout, MonitorResizeState, MonitorViewport, OutputGeometry};
 use crate::outputs::SelectedOutput;
 use crate::rail::bounded_window_size;
 
 type Surface = softbuffer::Surface<OwnedDisplayHandle, Arc<Window>>;
+
+enum DesktopSurface {
+    Software(Surface),
+    Gpu(Box<GpuSurface>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MonitorId(usize);
@@ -24,7 +30,7 @@ struct DesktopWindow {
     monitor_id: MonitorId,
     remote_index: usize,
     window: Arc<Window>,
-    surface: Surface,
+    surface: DesktopSurface,
     viewport: Option<MonitorViewport>,
     presented_size: Option<PhysicalSize<u32>>,
     damage: MonitorDamage,
@@ -35,6 +41,8 @@ struct DesktopWindow {
 /// Presents a shared desktop in windows using the server's monitor definitions.
 pub(crate) struct MonitorWindows {
     windows: Vec<DesktopWindow>,
+    renderer: RendererKind,
+    gpu: Option<GpuDesktop>,
     preferred_primary: MonitorId,
     outputs: Vec<SelectedOutput>,
     output_geometries: Vec<OutputGeometry>,
@@ -163,14 +171,11 @@ impl MonitorWindows {
         Ok(())
     }
 
-    pub(crate) fn into_single_window(mut self) -> (Arc<Window>, Surface) {
-        let view = self.windows.pop().expect("prepared desktop has one window");
-        (view.window, view.surface)
-    }
-
-    pub(crate) fn new(initial_size: PhysicalSize<u32>, scale_factor: u32) -> Self {
+    pub(crate) fn new(initial_size: PhysicalSize<u32>, scale_factor: u32, renderer: RendererKind) -> Self {
         Self {
             windows: Vec::new(),
+            renderer,
+            gpu: None,
             preferred_primary: MonitorId(0),
             outputs: Vec::new(),
             output_geometries: Vec::new(),
@@ -251,6 +256,9 @@ impl MonitorWindows {
     }
 
     pub(crate) fn reset(&mut self) {
+        if let Some(gpu) = &mut self.gpu {
+            gpu.invalidate();
+        }
         self.layout = None;
         self.frame.clear();
         self.resizes.reset();
@@ -319,6 +327,9 @@ impl MonitorWindows {
     ) -> anyhow::Result<()> {
         let sync_windows = self.awaiting_frame || self.frame.size() != (update.width().get(), update.height().get());
         self.frame.apply(update)?;
+        if let Some(gpu) = &mut self.gpu {
+            gpu.mark_dirty(update.region());
+        }
         self.resizes.observe_frame(self.frame.size());
         self.awaiting_frame = false;
         // UNTESTED: pixel-only updates must retain window bindings and wake only affected outputs.
@@ -421,8 +432,22 @@ impl MonitorWindows {
                 window.request_redraw();
                 window.set_cursor(self.cursor.clone());
                 window.set_cursor_visible(self.cursor_visible);
-                let surface = softbuffer::Surface::new(context, Arc::clone(&window))
-                    .map_err(|error| anyhow::anyhow!("unable to create monitor surface: {error}"))?;
+                let surface = match self.renderer {
+                    RendererKind::Softbuffer => DesktopSurface::Software(
+                        softbuffer::Surface::new(context, Arc::clone(&window))
+                            .map_err(|error| anyhow::anyhow!("unable to create monitor surface: {error}"))?,
+                    ),
+                    RendererKind::Wgpu => {
+                        let surface = if let Some(gpu) = &self.gpu {
+                            gpu.create_surface(Arc::clone(&window))?
+                        } else {
+                            let (gpu, surface) = GpuDesktop::new(Arc::clone(&window))?;
+                            self.gpu = Some(gpu);
+                            surface
+                        };
+                        DesktopSurface::Gpu(Box::new(surface))
+                    }
+                };
                 self.windows.push(DesktopWindow {
                     monitor_id,
                     remote_index: index,
@@ -455,14 +480,25 @@ impl MonitorWindows {
         if bounded_window_size(size.width, size.height) != (size.width, size.height) {
             return Ok(());
         }
+        let surface = match &mut view.surface {
+            DesktopSurface::Gpu(surface) => {
+                let gpu = self.gpu.as_mut().context("GPU desktop is not initialized")?;
+                if surface.present(gpu, &self.frame, view.viewport.filter(|_| !self.awaiting_frame))? {
+                    view.presented_size = Some(size);
+                    view.updates_presented = view.updates_applied;
+                    view.damage.presented((size.width, size.height));
+                }
+                return Ok(());
+            }
+            DesktopSurface::Software(surface) => surface,
+        };
         if view.presented_size != Some(size) {
             view.damage.invalidate();
-            view.surface
+            surface
                 .resize(width, height)
                 .map_err(|error| anyhow::anyhow!("unable to resize monitor surface: {error}"))?;
         }
-        let mut buffer = view
-            .surface
+        let mut buffer = surface
             .buffer_mut()
             .map_err(|error| anyhow::anyhow!("unable to acquire monitor buffer: {error}"))?;
         // UNTESTED: backend buffer ages must match successful presentations for partial repairs.
@@ -534,6 +570,9 @@ impl MonitorWindows {
         let updates_applied = view.updates_applied;
         let updates_presented = view.updates_presented;
         view.damage.invalidate();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.invalidate();
+        }
         info!(
             monitor,
             updates_applied,

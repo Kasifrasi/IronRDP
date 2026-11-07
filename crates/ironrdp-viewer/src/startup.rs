@@ -68,6 +68,7 @@ impl<'a> WindowedApp<'a> {
         let mut windows = MonitorWindows::new(
             PhysicalSize::new(u32::from(primary.width), u32::from(primary.height)),
             options.scale_factor.unwrap_or(100),
+            options.renderer,
         );
         windows.prepare(options.layout.clone());
         Ok(Self {
@@ -124,7 +125,6 @@ impl<'a> WindowedApp<'a> {
             desktop.windows,
             connection.input_sender,
             PhysicalSize::new(u32::from(layout.size().0), u32::from(layout.size().1)),
-            1 < layout.monitors().len(),
         );
         #[cfg(target_os = "macos")]
         let app = match connection.clipboard {
