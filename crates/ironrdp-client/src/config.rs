@@ -1820,7 +1820,9 @@ impl ConfigBuilder {
     }
 
     /// Enable or disable RDPSND (audio) playback.
-    #[cfg(feature = "sound")]
+    ///
+    /// Local playback requires the `sound` Cargo feature.
+    /// The audio mode and client-info flag are set even when that feature is disabled.
     #[must_use]
     pub fn with_sound(self, enabled: bool) -> Self {
         self.with_audio_mode(if enabled {
@@ -1835,10 +1837,13 @@ impl ConfigBuilder {
     /// `PlayOnServer` and `Disabled` currently share the same client-info outcome:
     /// both clear local RDPSND playback and set `INFO_NOAUDIOPLAYBACK`. Distinct
     /// `INFO_REMOTECONSOLEAUDIO` (true “play on server console”) is not wired yet.
-    #[cfg(feature = "sound")]
+    /// Local playback requires the `sound` Cargo feature.
     #[must_use]
     pub fn with_audio_mode(mut self, mode: ironrdp_cfg::AudioMode) -> Self {
-        self.channels.sound = matches!(mode, ironrdp_cfg::AudioMode::RedirectToClient);
+        #[cfg(feature = "sound")]
+        {
+            self.channels.sound = matches!(mode, ironrdp_cfg::AudioMode::RedirectToClient);
+        }
         self.enable_audio_playback = Some(matches!(mode, ironrdp_cfg::AudioMode::RedirectToClient));
         self.properties.set_audio_mode(mode);
         self
