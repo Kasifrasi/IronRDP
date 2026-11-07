@@ -58,7 +58,16 @@ fn main() -> anyhow::Result<()> {
     }
 
     debug!("Initialize App");
-    let event_loop = EventLoop::<RdpOutputEvent>::with_user_event().build()?;
+    let mut event_loop_builder = EventLoop::<RdpOutputEvent>::with_user_event();
+    #[cfg(target_os = "linux")]
+    if desktop_options
+        .as_ref()
+        .is_some_and(|options| options.renderer == ironrdp_viewer::cli::RendererKind::Wgpu)
+    {
+        use winit::platform::wayland::EventLoopBuilderExtWayland as _;
+        event_loop_builder.with_wayland();
+    }
+    let event_loop = event_loop_builder.build()?;
     let event_loop_proxy = event_loop.create_proxy();
     let (output_event_sender, mut output_event_receiver) = output_channel(64);
     // Native clipboard and device services stay on this thread until the event loop returns.
@@ -85,11 +94,6 @@ fn main() -> anyhow::Result<()> {
             u32::from(config.connector().desktop_size.width),
             u32::from(config.connector().desktop_size.height),
         );
-        let multiple_monitors = config
-            .connector()
-            .monitor_layout
-            .as_ref()
-            .is_some_and(|layout| 1 < layout.monitors.len());
         #[cfg(windows)]
         let enable_smartcard = config.channels().rdpdr.smartcard;
         #[cfg(windows)]
@@ -99,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(windows)]
         let drives = ironrdp_viewer::drives::ViewerDrives::from_rdpdr_config(&config.channels().rdpdr, named_drives);
         let client = RdpClient::new(config, output_event_sender);
-        let client = if multiple_monitors {
+        let client = if desktop.is_some() {
             client.with_desktop_updates()
         } else {
             client

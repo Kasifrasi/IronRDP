@@ -1,10 +1,14 @@
 # IronRDP Viewer
 
-Portable RDP client without GPU acceleration.
+RDP client with software presentation and a Vulkan desktop renderer for Linux x86_64 on Wayland.
+The viewer uses winit for windowing and non-blocking, asynchronous I/O from the IronRDP crates.
 
-This is a a full-fledged RDP client based on IronRDP crates suite, and implemented using
-non-blocking, asynchronous I/O. Portability is achieved by using softbuffer for rendering
-and winit for windowing.
+Native desktop connections default to `--renderer wgpu`.
+Monitor windows share a persistent desktop texture; only changed regions are uploaded, and the GPU handles cropping and nearest-neighbor scaling.
+A hardware Vulkan adapter and its loader must be available at runtime.
+The selected adapter, driver and presentation mode are logged during startup.
+Use `--renderer softbuffer` for software rendering or on other platforms.
+RemoteApp and RPC windows retain software presentation, and graphics decoding still runs on the CPU.
 
 ## Prebuilt binaries
 

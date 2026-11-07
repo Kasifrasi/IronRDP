@@ -15,6 +15,7 @@ pub mod clipboard;
 mod desktop;
 #[cfg(windows)]
 pub mod drives;
+pub mod gpu;
 mod keymap;
 pub mod monitor;
 pub mod outputs;
