@@ -1165,6 +1165,14 @@ impl GraphicsPipelineClient {
     }
 
     fn handle_wire_to_surface1(&mut self, pdu: crate::pdu::WireToSurface1Pdu) -> PduResult<()> {
+        debug!(
+            target: "ironrdp_egfx::quality",
+            surface_id = pdu.surface_id,
+            codec = ?pdu.codec_id,
+            rectangle = ?pdu.destination_rectangle,
+            encoded_bytes = pdu.bitmap_data.len(),
+            "Received surface update"
+        );
         let surface = self
             .surfaces
             .get(&pdu.surface_id)
@@ -1232,6 +1240,67 @@ impl GraphicsPipelineClient {
     /// Decode RemoteFX Progressive bitmap data, applying each decoded tile to the
     /// persistent surface before delivering the same RGBA update to the handler.
     fn handle_wire_to_surface2(&mut self, pdu: WireToSurface2Pdu) -> PduResult<()> {
+        // UNTESTED: metadata inspection must preserve decoding output and omit compressed component streams.
+        // Compare a capture with this target enabled and disabled when changing the diagnostic fields.
+        if tracing::enabled!(target: "ironrdp_egfx::quality", tracing::Level::DEBUG) {
+            use ironrdp_pdu::codecs::rfx::progressive::{
+                ProgressiveBlock, ProgressiveTile, TILE_FLAG_DIFFERENCE, decode_progressive_stream,
+            };
+
+            if let Ok(blocks) = decode_progressive_stream(&pdu.bitmap_data) {
+                for block in blocks {
+                    let ProgressiveBlock::Region(region) = block else {
+                        continue;
+                    };
+                    let mut simple_tiles = 0;
+                    let mut first_tiles = 0;
+                    let mut upgrade_tiles = 0;
+                    let mut difference_tiles = 0;
+                    let mut quality_counts = [0usize; 256];
+                    for tile in &region.tiles {
+                        let (quality, flags) = match tile {
+                            ProgressiveTile::Simple(tile) => {
+                                simple_tiles += 1;
+                                difference_tiles += usize::from(tile.flags & TILE_FLAG_DIFFERENCE != 0);
+                                continue;
+                            }
+                            ProgressiveTile::First(tile) => {
+                                first_tiles += 1;
+                                (tile.quality, tile.flags)
+                            }
+                            ProgressiveTile::Upgrade(tile) => {
+                                upgrade_tiles += 1;
+                                (tile.quality, 0)
+                            }
+                        };
+                        difference_tiles += usize::from(flags & TILE_FLAG_DIFFERENCE != 0);
+                        quality_counts[usize::from(quality)] += 1;
+                    }
+                    let quality_indexes: Vec<_> = quality_counts
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, count)| **count != 0)
+                        .collect();
+                    debug!(
+                        target: "ironrdp_egfx::quality",
+                        surface_id = pdu.surface_id,
+                        codec_context_id = pdu.codec_context_id,
+                        rectangle_count = region.rects.len(),
+                        rectangle_preview = ?region.rects.iter().take(4).collect::<Vec<_>>(),
+                        simple_tiles,
+                        first_tiles,
+                        upgrade_tiles,
+                        difference_tiles,
+                        ?quality_indexes,
+                        base_quant_table_count = region.quant_vals.len(),
+                        base_quant_preview = ?region.quant_vals.iter().take(2).collect::<Vec<_>>(),
+                        progressive_quant_table_count = region.quant_prog_vals.len(),
+                        progressive_quant_preview = ?region.quant_prog_vals.iter().take(2).collect::<Vec<_>>(),
+                        "Received Progressive refinement metadata"
+                    );
+                }
+            }
+        }
         let surface = self
             .surfaces
             .get(&pdu.surface_id)
@@ -1252,6 +1321,13 @@ impl GraphicsPipelineClient {
             }
         };
 
+        debug!(
+            target: "ironrdp_egfx::quality",
+            surface_id = pdu.surface_id,
+            codec_context_id = pdu.codec_context_id,
+            output_tiles = tiles.len(),
+            "Decoded Progressive update"
+        );
         for tile in tiles {
             let tile_left = tile.x_idx.saturating_mul(TILE_DIM);
             let tile_top = tile.y_idx.saturating_mul(TILE_DIM);
@@ -1343,6 +1419,13 @@ impl GraphicsPipelineClient {
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
         trace!(surface_id, ?stream, "AVC420 update");
+        debug!(
+            target: "ironrdp_egfx::quality",
+            surface_id,
+            rectangle_count = stream.rectangles.len(),
+            quality_preview = ?stream.quant_qual_vals.iter().take(8).collect::<Vec<_>>(),
+            "Received AVC420 quality metadata"
+        );
 
         let Some(decoder) = self.surface_h264_decoder(surface_id)? else {
             debug!("No H.264 decoder configured, skipping AVC420 frame");
@@ -2049,6 +2132,12 @@ impl GraphicsPipelineClient {
 
     #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
     fn handle_end_frame(&mut self, frame_id: u32) -> PduResult<Vec<DvcMessage>> {
+        debug!(
+            target: "ironrdp_egfx::quality",
+            frame_id,
+            dropped_updates = self.dropped_updates,
+            "Graphics frame completed"
+        );
         self.total_frames_decoded = self.total_frames_decoded.wrapping_add(1);
         self.current_frame_id = None;
 
