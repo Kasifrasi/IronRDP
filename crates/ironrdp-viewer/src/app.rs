@@ -21,7 +21,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize};
 use winit::event::{self, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHandle};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Cursor, CursorIcon, CustomCursor, Window, WindowAttributes};
 
 use crate::desktop::MonitorWindows;
@@ -98,6 +98,7 @@ pub struct RpcApp {
     /// session input queue.
     release_pending: bool,
     monitor_focus: MonitorFocusState,
+    local_repaint_enabled: bool,
 }
 
 impl App {
@@ -169,6 +170,10 @@ impl RpcApp {
         remote_app: bool,
     ) -> Self {
         let input_database = ironrdp::input::Database::new();
+        let local_repaint_enabled = std::env::var("IRONRDP_LOCAL_REPAINT").is_ok_and(|value| value == "1");
+        if local_repaint_enabled {
+            info!("Local monitor repaint diagnostic enabled; F12 repaints the stored desktop");
+        }
         Self {
             input_target,
             frame_wakeup,
@@ -193,6 +198,7 @@ impl RpcApp {
             pending_rail_inputs: std::collections::VecDeque::new(),
             release_pending: false,
             monitor_focus: MonitorFocusState::default(),
+            local_repaint_enabled,
         }
     }
 
@@ -749,6 +755,20 @@ impl RpcApp {
             return;
         }
         match event {
+            // UNTESTED: consume both F12 transitions before forwarding input so the repaint stays local.
+            // Check a diagnostic F12 press and release against server input when changing this handler.
+            WindowEvent::KeyboardInput {
+                event, is_synthetic, ..
+            } if self.local_repaint_enabled && event.physical_key == PhysicalKey::Code(KeyCode::F12) => {
+                if !is_synthetic
+                    && !event.repeat
+                    && event.state == event::ElementState::Pressed
+                    && let Some(monitors) = &mut self.monitor_windows
+                    && let Err(error) = monitors.repaint_locally(window_id)
+                {
+                    warn!(%error, "Unable to repaint the stored desktop");
+                }
+            }
             WindowEvent::CloseRequested => {
                 self.close_requested = true;
                 if let InputTarget::Direct(sender) = &self.input_target {

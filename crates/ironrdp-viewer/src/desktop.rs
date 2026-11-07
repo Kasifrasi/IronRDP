@@ -28,6 +28,8 @@ struct DesktopWindow {
     viewport: Option<MonitorViewport>,
     presented_size: Option<PhysicalSize<u32>>,
     damage: MonitorDamage,
+    updates_applied: u64,
+    updates_presented: u64,
 }
 
 /// Presents a shared desktop in windows using the server's monitor definitions.
@@ -323,6 +325,9 @@ impl MonitorWindows {
         // Check activity on one output, then a layout reset, when changing this gate.
         if sync_windows {
             self.sync_windows(event_loop, context)?;
+            for view in &mut self.windows {
+                view.updates_applied = view.updates_applied.saturating_add(1);
+            }
         } else {
             let region = update.region();
             for view in &mut self.windows {
@@ -333,6 +338,7 @@ impl MonitorWindows {
                     .and_then(|viewport| viewport.damage_region(&region, (size.width, size.height)))
                 {
                     view.damage.add(damage);
+                    view.updates_applied = view.updates_applied.saturating_add(1);
                     view.window.request_redraw();
                 }
             }
@@ -425,6 +431,8 @@ impl MonitorWindows {
                     viewport,
                     presented_size: None,
                     damage: MonitorDamage::default(),
+                    updates_applied: 0,
+                    updates_presented: 0,
                 });
             }
         }
@@ -503,6 +511,40 @@ impl MonitorWindows {
             .context("monitor redraw")?;
         view.damage.presented((size.width, size.height));
         view.presented_size = Some(size);
+        view.updates_presented = view.updates_applied;
+        Ok(())
+    }
+
+    /// Immediately repaints one window from the stored desktop without contacting the server.
+    pub(crate) fn repaint_locally(&mut self, id: WindowId) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.awaiting_frame, "desktop image is not ready for a local repaint");
+        let view = self
+            .windows
+            .iter_mut()
+            .find(|view| view.window.id() == id)
+            .context("unknown monitor window")?;
+        let size = view.window.inner_size();
+        anyhow::ensure!(
+            size.width != 0
+                && size.height != 0
+                && bounded_window_size(size.width, size.height) == (size.width, size.height),
+            "monitor window size is not drawable"
+        );
+        let monitor = view.monitor_id.0 + 1;
+        let updates_applied = view.updates_applied;
+        let updates_presented = view.updates_presented;
+        view.damage.invalidate();
+        info!(
+            monitor,
+            updates_applied,
+            updates_presented,
+            frame_size = ?self.frame.size(),
+            window_size = ?size,
+            "Starting local full repaint"
+        );
+        // Bypass the redraw request to distinguish stored pixels from stalled redraw delivery.
+        self.draw(id)?;
+        info!(monitor, updates_applied, "Completed local full repaint");
         Ok(())
     }
 
