@@ -89,6 +89,9 @@ fn main() -> anyhow::Result<()> {
         .with_destination(Destination::new(options.host.clone())?)
         .with_username(options.username)
         .with_password(password)
+        // UNTESTED: SDL must keep playback disabled when Cargo unifies the sound feature.
+        // Check standalone and combined viewer builds when changing this setting.
+        .with_sound(false)
         .with_keyboard_layout(options.keyboard_layout)
         .with_connection_type(ironrdp_pdu::gcc::ConnectionType::Lan)
         .with_graphics_pipeline(true)

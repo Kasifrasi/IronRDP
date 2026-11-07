@@ -1564,6 +1564,22 @@ fn viewer_monitor_count_rejects_incompatible_arguments(#[case] extra: &[&str]) {
 }
 
 #[test]
+fn with_sound_disabled_suppresses_local_playback() {
+    // oracle: reference crates/ironrdp-viewer-sdl/README.md excludes audio; its opt-out must suppress local playback.
+    let config = complete_builder()
+        .with_sound(false)
+        .build()
+        .expect("valid configuration");
+
+    assert!(!config.connector().enable_audio_playback);
+    assert!(!config.channels().sound);
+    assert_eq!(
+        config.properties().audio_mode().unwrap(),
+        Some(ironrdp_cfg::AudioMode::Disabled)
+    );
+}
+
+#[test]
 fn with_audio_mode_redirect_enables_playback_channel() {
     use ironrdp_cfg::AudioMode;
 
