@@ -1406,6 +1406,8 @@ impl ProgressiveDecoder {
                 },
             )?;
 
+            // Region's band operations use exclusive edges despite the rectangle type.
+            // Keep that convention through clipping so one-pixel bands remain nonempty.
             let mut clipping_region = Region::new();
             for rectangle in &region.rects {
                 let left = rectangle.x.min(surface_width);
@@ -1420,8 +1422,8 @@ impl ProgressiveDecoder {
                     clipping_region.union_rectangle(InclusiveRectangle {
                         left,
                         top,
-                        right: right - 1,
-                        bottom: bottom - 1,
+                        right,
+                        bottom,
                     });
                 }
             }
@@ -1444,16 +1446,17 @@ impl ProgressiveDecoder {
                     .intersect_rectangle(&InclusiveRectangle {
                         left,
                         top,
-                        right: right - 1,
-                        bottom: bottom - 1,
+                        right,
+                        bottom,
                     })
                     .rectangles
                     .into_iter()
+                    .filter(|rectangle| rectangle.left < rectangle.right && rectangle.top < rectangle.bottom)
                     .map(|rectangle| ExclusiveRectangle {
                         left: rectangle.left,
                         top: rectangle.top,
-                        right: rectangle.right + 1,
-                        bottom: rectangle.bottom + 1,
+                        right: rectangle.right,
+                        bottom: rectangle.bottom,
                     })
                     .collect::<Vec<_>>();
                 if update_rectangles.is_empty() {
