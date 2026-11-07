@@ -228,8 +228,9 @@ pub(crate) fn run(
                 }
                 RdpOutputEvent::DesktopUpdate(update) => {
                     let previous_size = desktop.size();
-                    let changed = desktop.apply(&update)?;
-                    tracing::trace!(region = ?changed, "Received desktop update");
+                    let Some(changed) = desktop.push(update)? else {
+                        continue;
+                    };
                     if desktop.size() != previous_size {
                         tracing::info!(size = ?desktop.size(), "Received desktop framebuffer");
                     }
@@ -245,8 +246,11 @@ pub(crate) fn run(
                             continue;
                         }
                     }
-                    for (renderer, canvas) in renderers.iter_mut().zip(&mut canvases) {
-                        renderer.upload(canvas, &desktop, changed)?;
+                    for changed in changed {
+                        tracing::trace!(region = ?changed, "Received desktop update");
+                        for (renderer, canvas) in renderers.iter_mut().zip(&mut canvases) {
+                            renderer.upload(canvas, &desktop, changed)?;
+                        }
                     }
                 }
                 RdpOutputEvent::MonitorLayoutRejected => {
@@ -276,8 +280,14 @@ pub(crate) fn run(
                         Err(error) => tracing::warn!(%error, "Failed to create remote mouse cursor"),
                     }
                 }
-                RdpOutputEvent::ConnectionFailure(error) => return Err(error).context("RDP connection failed"),
-                RdpOutputEvent::Terminated(result) => return result.map(|_| ()).context("RDP session failed"),
+                RdpOutputEvent::ConnectionFailure(error) => {
+                    desktop.clear();
+                    return Err(error).context("RDP connection failed");
+                }
+                RdpOutputEvent::Terminated(result) => {
+                    desktop.clear();
+                    return result.map(|_| ()).context("RDP session failed");
+                }
                 _ => {}
             }
         }

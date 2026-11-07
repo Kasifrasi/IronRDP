@@ -1,4 +1,4 @@
-use ironrdp_client::rdp::DesktopUpdate;
+use ironrdp_client::rdp::{DesktopUpdate, DesktopUpdateBatch};
 use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntry};
 use ironrdp_input::MousePosition;
 use ironrdp_pdu::gcc::{ClientMonitorData, MONITOR_COUNT_MAX, Monitor, MonitorFlags};
@@ -280,9 +280,21 @@ impl Layout {
 pub struct Desktop {
     pixels: Vec<u32>,
     size: (u16, u16),
+    pending: DesktopUpdateBatch,
 }
 
 impl Desktop {
+    pub fn push(&mut self, update: DesktopUpdate) -> anyhow::Result<Option<Vec<Viewport>>> {
+        let Some(updates) = self.pending.push(update) else {
+            return Ok(None);
+        };
+        let changed = updates
+            .iter()
+            .map(|update| self.apply(update))
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Some(changed))
+    }
+
     pub fn apply(&mut self, update: &DesktopUpdate) -> anyhow::Result<Viewport> {
         let size = (update.width().get(), update.height().get());
         Layout::check_size(size)?;
