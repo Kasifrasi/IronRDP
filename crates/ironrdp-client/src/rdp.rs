@@ -4702,8 +4702,12 @@ async fn active_session(
     let mut rdpei_input_state = None;
     #[cfg(feature = "telemetry")]
     let mut connection_telemetry = crate::telemetry::ConnectionTelemetry::new(connection_started);
+    let mut quality_pdu_sequence = 0u64;
+    let mut quality_last_read_at = None;
+    let mut quality_last_pdu_at: Option<Instant> = None;
 
     let disconnect_reason = 'outer: loop {
+        let mut quality_pdu_timing = None;
         let resize_deadline = resize_queue.deadline();
         let input_batch_deadline = input_batcher.deadline();
         #[cfg(feature = "video")]
@@ -4773,8 +4777,43 @@ async fn active_session(
                         Err(error) => return Err(ironrdp_session::custom_err!("read frame", error)),
                     };
                     trace!(?action, frame_length = payload.len(), "Frame received");
+                    // UNTESTED: these live timings bracket processing and output delivery, not network arrival.
+                    // Compare marked playback transitions with tracing enabled and disabled when changing them.
+                    let quality_entered =
+                        tracing::enabled!(target: "ironrdp_client::quality", tracing::Level::TRACE).then(|| {
+                            let entered = Instant::now();
+                            quality_pdu_sequence = quality_pdu_sequence.wrapping_add(1);
+                            let read_at = reader.last_read_at();
+                            trace!(
+                                target: "ironrdp_client::quality",
+                                pdu_sequence = quality_pdu_sequence,
+                                stream = "primary",
+                                ?action,
+                                pdu_bytes = payload.len(),
+                                framed_buffered_bytes = reader.peek().len(),
+                                read_completed_at_ms = ?read_at.map(|at| at.as_millis()),
+                                same_read_timestamp = read_at.is_some() && read_at == quality_last_read_at,
+                                previous_pdu_gap_us = ?quality_last_pdu_at.map(|at| entered.duration_since(at).as_micros()),
+                                "PDU processing started"
+                            );
+                            quality_last_read_at = read_at;
+                            quality_last_pdu_at = Some(entered);
+                            entered
+                        });
+                    let quality_started = quality_entered.map(|entered| (entered, Instant::now()));
                     let mut outputs =
                         active_stage.process(&mut image, action, &payload, reader.last_read_at())?;
+                    if let Some((entered, started)) = quality_started {
+                        let processed = Instant::now();
+                        trace!(
+                            target: "ironrdp_client::quality",
+                            pdu_sequence = quality_pdu_sequence,
+                            process_us = processed.duration_since(started).as_micros(),
+                            output_count = outputs.len(),
+                            "PDU processing completed"
+                        );
+                        quality_pdu_timing = Some((quality_pdu_sequence, entered, processed));
+                    }
                     #[cfg(feature = "rdpdr")]
                     if let Some(output) = poll_deferred_rdpdr_output(&mut active_stage)? {
                         outputs.push(output);
@@ -5491,6 +5530,8 @@ async fn active_session(
                     return Ok(RdpControlFlow::ServerRedirection(redirection));
                 }
                 ActiveStageOutput::ResponseFrame(frame) => {
+                    let quality_write_started =
+                        tracing::enabled!(target: "ironrdp_client::quality", tracing::Level::TRACE).then(Instant::now);
                     let Some(result) = cancelable_operation(writer.write_all(&frame), close_receiver).await else {
                         return Ok(RdpControlFlow::TerminatedGracefully(
                             GracefulDisconnectReason::UserInitiated,
@@ -5501,6 +5542,16 @@ async fn active_session(
                             "write response",
                             error
                         )));
+                    }
+                    if let Some(started) = quality_write_started {
+                        trace!(
+                            target: "ironrdp_client::quality",
+                            pdu_sequence = ?quality_pdu_timing.map(|(sequence, _, _)| sequence),
+                            response_bytes = frame.len(),
+                            process_to_write_us = ?quality_pdu_timing.map(|(_, _, processed)| started.duration_since(processed).as_micros()),
+                            write_us = started.elapsed().as_micros(),
+                            "Primary stream response write completed"
+                        );
                     }
                 }
                 ActiveStageOutput::GraphicsUpdate(region) => {
@@ -6179,6 +6230,16 @@ async fn active_session(
                 }
                 Some(false) => {}
             }
+        }
+        if let Some((sequence, entered, processed)) = quality_pdu_timing {
+            let completed = Instant::now();
+            trace!(
+                target: "ironrdp_client::quality",
+                pdu_sequence = sequence,
+                pdu_entry_to_outputs_us = completed.duration_since(entered).as_micros(),
+                process_to_outputs_us = completed.duration_since(processed).as_micros(),
+                "PDU outputs completed"
+            );
         }
     };
 

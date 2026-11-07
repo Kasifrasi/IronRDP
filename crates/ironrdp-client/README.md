@@ -65,6 +65,23 @@ The optional `video` feature accepts MS-RDPEVOR video optimized remoting and MS-
 Windows servers only keep the video channels open when the graphics pipeline is enabled.
 Decoded pictures are shown at their presentation time, scaled and clipped to the tracked geometry, and composited into the framebuffer like graphics pipeline updates.
 
+For playback diagnostics, enable `ironrdp_client::quality=trace,ironrdp_egfx::quality=debug,ironrdp_egfx::client=debug` in the embedder's tracing filter.
+Both `ironrdp-viewer` and `ironrdp-viewer-sdl` read this filter from `IRONRDP_LOG`.
+The client target brackets each PDU's processing on the primary framed stream, generic response writes, and output delivery with a local `pdu_sequence`.
+This stream can use direct connections, gateway carriers, or named pipes.
+Ordered EGFX quality entries between processing start and completion identify the codec and quality metadata handled in that PDU; a PDU can contain part of a graphics frame or several frames.
+`process_us` brackets `active_stage.process` after the start log and before the completion log; it includes decoding, session compositing, and any logging inside that call.
+`pdu_entry_to_outputs_us` starts at the diagnostic entry after the framed read returns and includes the start log, processing, and subsequent output work.
+`process_to_outputs_us` includes the completion log, subsequent work, output packing, transport writes, and waits for the embedder's bounded output channel.
+`process_to_write_us` and `write_us` describe generic primary-stream responses, which can include frame acknowledgements; they do not identify individual acknowledgements or confirm server receipt.
+`read_completed_at_ms` is the framing driver's latest user-space read completion, with an arbitrary epoch and millisecond resolution.
+`framed_buffered_bytes` counts all remaining framed transport bytes, and equal read timestamps can also result from distinct reads in the same millisecond.
+Neither field measures kernel receive backlog, packet arrival, or the protocol's graphics-only `queueDepth`.
+UDP sideband graphics processing is outside these primary-stream timing brackets.
+Timing clocks are read only when the client target is enabled, and per-PDU log output can itself affect throughput; compare the same marked play, pause, and resume sequence with diagnostics disabled.
+Optional `IRONRDP_GFX_CAPTURE=/path/to/new.capture` also records decompressed EGFX messages for at most 60 seconds or 256 MiB; it adds synchronous file work and observes channel processing time rather than network arrival.
+Leave that variable unset for the initial timing run and for the uninstrumented comparison.
+
 The optional `telemetry` feature answers the MS-RDPET telemetry channel with one report per connection: the milliseconds from initiating the connection to opening the graphics pipeline channel and to receiving its first message.
 It is off by default; `ConfigBuilder::with_telemetry(true)` enables it.
 
