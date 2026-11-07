@@ -819,6 +819,8 @@ impl RailWindows {
         match local.surface.buffer_mut() {
             Ok(mut buffer) => {
                 buffer.copy_from_slice(&pixels);
+                // UNTESTED: Wayland frame callbacks must pace redraws; check live playback and resize.
+                local.window.pre_present_notify();
                 if let Err(error) = buffer.present() {
                     debug!(window_id, %error, "Unable to present a RemoteApp window");
                 }

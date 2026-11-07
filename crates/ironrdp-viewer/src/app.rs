@@ -452,11 +452,13 @@ impl RpcApp {
         if self.buffer.is_empty() {
             return;
         }
-        let Some((_, surface)) = self.window.as_mut() else {
+        let Some((window, surface)) = self.window.as_mut() else {
             return;
         };
         let mut sb_buffer = surface.buffer_mut().expect("surface buffer");
         sb_buffer.copy_from_slice(self.buffer.as_slice());
+        // UNTESTED: Wayland frame callbacks must pace redraws; check live playback and resize.
+        window.pre_present_notify();
         sb_buffer.present().expect("buffer present");
     }
     fn on_about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
