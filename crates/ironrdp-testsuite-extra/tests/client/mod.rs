@@ -3,6 +3,7 @@ mod cloud;
 mod config;
 mod core_input;
 mod egfx_cache;
+mod egfx_capabilities;
 mod entra;
 mod input;
 mod multipoint;

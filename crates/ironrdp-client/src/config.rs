@@ -535,6 +535,8 @@ pub struct ChannelConfig {
     /// Defaults to [`crate::h264::H264DecoderFactory::platform_default`]: Media Foundation's on
     /// Windows, or OpenH264 with the `openh264` feature.
     pub h264_decoder: Option<crate::h264::H264DecoderFactory>,
+    /// Optional graphics capability sets; unsupported decoder modes are filtered before advertisement.
+    pub graphics_capabilities: Option<Vec<ironrdp_egfx::pdu::CapabilitySet>>,
     /// File keeping the graphics pipeline's bitmap cache across sessions ([MS-RDPEGFX] 3.3.1.5),
     /// so a reconnect paints from cached tiles instead of waiting for the server to resend them.
     /// `None` keeps the cache in memory only.
@@ -597,6 +599,7 @@ impl Default for ChannelConfig {
             #[cfg(feature = "pnp")]
             pnp: None,
             h264_decoder: crate::h264::H264DecoderFactory::platform_default(),
+            graphics_capabilities: None,
             egfx_persistent_cache: None,
         }
     }
@@ -1664,6 +1667,16 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_graphics_pipeline(mut self, enabled: bool) -> Self {
         self.graphics_pipeline = Some(enabled);
+        self
+    }
+
+    /// Advertise custom graphics capability sets instead of the default list.
+    ///
+    /// Sets requiring unavailable decoder modes are filtered before advertisement.
+    /// The server still selects the codec and compression quality.
+    #[must_use]
+    pub fn with_graphics_capabilities(mut self, capabilities: Vec<ironrdp_egfx::pdu::CapabilitySet>) -> Self {
+        self.channels.graphics_capabilities = Some(capabilities);
         self
     }
 

@@ -29,6 +29,7 @@ use ironrdp_dvc::DvcMessageBatch;
 use ironrdp_dvc::pdu::SoftSyncTunnelType;
 use ironrdp_echo::client::EchoClient;
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+use ironrdp_egfx::pdu::CapabilitySet;
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::gcc::{ChannelName, ClientMonitorData, MONITOR_COUNT_MAX, Monitor, MonitorFlags};
@@ -2491,6 +2492,24 @@ fn build_connector(
         }
     }
 
+    struct ConfiguredEgfxHandler {
+        inner: EgfxHandler,
+        capabilities: Vec<CapabilitySet>,
+    }
+    impl GraphicsPipelineHandler for ConfiguredEgfxHandler {
+        fn capabilities(&self) -> Vec<CapabilitySet> {
+            self.capabilities.clone()
+        }
+
+        fn on_message_received(&mut self, message: &[u8]) {
+            self.inner.on_message_received(message);
+        }
+
+        fn on_close(&mut self) {
+            self.inner.on_close();
+        }
+    }
+
     let h264_decoders = config
         .channels
         .h264_decoder
@@ -2507,12 +2526,17 @@ fn build_connector(
             RdpInputProtocolVersion::V300,
         ))
         .with_dynamic_channel({
-            let mut egfx = GraphicsPipelineClient::new(
-                Box::new(EgfxHandler {
-                    capture: crate::graphics_capture::Recorder::from_env(),
+            let handler = EgfxHandler {
+                capture: crate::graphics_capture::Recorder::from_env(),
+            };
+            let handler: Box<dyn GraphicsPipelineHandler> = match &config.channels.graphics_capabilities {
+                Some(capabilities) => Box::new(ConfiguredEgfxHandler {
+                    inner: handler,
+                    capabilities: capabilities.clone(),
                 }),
-                h264_decoder,
-            );
+                None => Box::new(handler),
+            };
+            let mut egfx = GraphicsPipelineClient::new(handler, h264_decoder);
             if let Some(decoders) = h264_decoders.cloned() {
                 egfx = egfx.with_h264_decoder_factory(Box::new(move || decoders.create()));
             }
