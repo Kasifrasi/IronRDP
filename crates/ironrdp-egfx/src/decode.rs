@@ -20,6 +20,8 @@
 
 use core::fmt;
 
+use ironrdp_pdu::geometry::ExclusiveRectangle;
+
 // ============================================================================
 // Decoded Frame
 // ============================================================================
@@ -218,6 +220,52 @@ impl Yuv420Frame {
             }
         }
         DecodedFrame::new(rgba, u32::from(self.width), u32::from(self.height))
+    }
+
+    /// Converts a region already clipped to this picture, preserving absolute chroma coordinates.
+    pub(crate) fn to_rgba_region(&self, region: &ExclusiveRectangle) -> Vec<u8> {
+        assert!(region.left <= region.right && region.right <= self.width);
+        assert!(region.top <= region.bottom && region.bottom <= self.height);
+        if region.left == 0 && region.top == 0 && region.right == self.width && region.bottom == self.height {
+            return self.to_rgba().into_data();
+        }
+
+        let left = usize::from(region.left);
+        let top = usize::from(region.top);
+        let width = usize::from(region.right - region.left);
+        let height = usize::from(region.bottom - region.top);
+        let mut rgba = vec![0; width * height * 4];
+        if width == 0 {
+            return rgba;
+        }
+
+        for (row, out) in rgba.chunks_exact_mut(width * 4).enumerate() {
+            let y_start = (top + row) * self.luma_stride + left;
+            let chroma_start = ((top + row) / 2) * self.chroma_stride + left / 2;
+            let y = &self.y[y_start..][..width];
+            let u = &self.u[chroma_start..];
+            let v = &self.v[chroma_start..];
+
+            // An odd left edge consumes the second pixel of its chroma pair first.
+            let leading = left % 2;
+            let (out_first, out) = out.split_at_mut(leading * 4);
+            if leading != 0 {
+                out_first.copy_from_slice(&crate::avc444::yuv_to_rgba(y[0], u[0], v[0]));
+            }
+            let (y, u, v) = (&y[leading..], &u[leading..], &v[leading..]);
+            let pairs = y.len() / 2;
+            let (out_pairs, out_last) = out.split_at_mut(pairs * 8);
+            for (((out, y), &u), &v) in out_pairs.chunks_exact_mut(8).zip(y.chunks_exact(2)).zip(u).zip(v) {
+                let chroma = crate::avc444::chroma_terms(u, v);
+                for (out, &y) in out.chunks_exact_mut(4).zip(y) {
+                    out.copy_from_slice(&crate::avc444::luma_to_rgba(y, chroma));
+                }
+            }
+            if !out_last.is_empty() {
+                out_last.copy_from_slice(&crate::avc444::yuv_to_rgba(y[pairs * 2], u[pairs], v[pairs]));
+            }
+        }
+        rgba
     }
 }
 

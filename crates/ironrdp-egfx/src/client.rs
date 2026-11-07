@@ -81,7 +81,7 @@ use crate::cache::{
     SMALL_CACHE_BYTES, SMALL_CACHE_SLOTS,
 };
 use crate::compositor::{Compositor, OutputUpdate};
-use crate::decode::{DecoderFactory, H264Decoder};
+use crate::decode::{DecodedFrame, DecoderFactory, H264Decoder, Yuv420Frame};
 use crate::pdu::{
     Avc420BitmapStream, Avc444BitmapStream, CacheImportOfferPdu, CacheImportReplyPdu, CacheToSurfacePdu,
     CapabilitiesAdvertisePdu, CapabilitiesV8Flags, CapabilitiesV10Flags, CapabilitiesV81Flags, CapabilitiesV103Flags,
@@ -1422,6 +1422,11 @@ impl GraphicsPipelineClient {
     }
 
     fn decode_avc420(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
+        enum Picture {
+            Yuv(Yuv420Frame),
+            Rgba(DecodedFrame),
+        }
+
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
         trace!(surface_id, ?stream, "AVC420 update");
@@ -1438,14 +1443,18 @@ impl GraphicsPipelineClient {
             return Ok(());
         };
 
-        // A decoder returning YUV planes is converted with the transform MS-RDPEGFX
-        // specifies, whatever matrix it would convert with itself.
-        let frame = if decoder.supports_yuv420() {
-            decoder.decode_yuv420(stream.data).map(|picture| picture.to_rgba())
+        // Keep YUV planes until clipping so partial updates convert only the pixels they paint.
+        // The conversion retains the MS-RDPEGFX transform regardless of the decoder's own matrix.
+        let mut frame = if decoder.supports_yuv420() {
+            decoder.decode_yuv420(stream.data).map(Picture::Yuv)
         } else {
-            decoder.decode(stream.data)
+            decoder.decode(stream.data).map(Picture::Rgba)
         }
         .map_err(|e| pdu_other_err!("H.264 decode", source: e))?;
+        let (frame_width, frame_height) = match &frame {
+            Picture::Yuv(picture) => (u32::from(picture.width()), u32::from(picture.height())),
+            Picture::Rgba(picture) => (picture.width(), picture.height()),
+        };
 
         // MS-RDPEGFX 2.2.1.4.1: RDPGFX_RECT16 right/bottom are exclusive (one-past-end),
         // so dimensions are right-left / bottom-top despite the parsed type's name.
@@ -1455,13 +1464,13 @@ impl GraphicsPipelineClient {
         // Decoded frame must be at least as large as the destination rectangle.
         // Larger is expected (macroblock alignment) and handled by cropping.
         // Smaller means the server sent mismatched dimensions.
-        if frame.width() < u32::from(dest_width) || frame.height() < u32::from(dest_height) {
+        if frame_width < u32::from(dest_width) || frame_height < u32::from(dest_height) {
             return Err(pdu_other_err!(
                 "decoded frame smaller than destination rectangle",
                 source: crate::decode::DecoderError::msg(format!(
                     "frame_width={}, frame_height={}, dest_width={dest_width}, dest_height={dest_height}",
-                    frame.width(),
-                    frame.height(),
+                    frame_width,
+                    frame_height,
                 )),
             ));
         }
@@ -1483,6 +1492,29 @@ impl GraphicsPipelineClient {
             .get(&surface_id)
             .map(|s| (s.width, s.height))
             .unwrap_or((dest_rect.right, dest_rect.bottom));
+
+        // Repeated or overlapping masks can cost more to convert separately than the whole picture.
+        // Retain full-picture conversion in that case, bounding conversion work by the frame area.
+        // UNTESTED: Partial masks below this cutoff must avoid a full-frame RGBA allocation.
+        // Overlapping masks above it must convert at most the frame area to bound repeated work.
+        // Compare allocations and converted pixels for partial, full, and overlapping masks when changing this path.
+        if let Picture::Yuv(picture) = &frame {
+            let requested_pixels = stream.rectangles.iter().fold(0u64, |area, region| {
+                let right = u32::from(region.right)
+                    .min(u32::from(surface_bounds.0))
+                    .min(frame_width);
+                let bottom = u32::from(region.bottom)
+                    .min(u32::from(surface_bounds.1))
+                    .min(frame_height);
+                area.saturating_add(
+                    u64::from(right.saturating_sub(u32::from(region.left)))
+                        * u64::from(bottom.saturating_sub(u32::from(region.top))),
+                )
+            });
+            if u64::from(frame_width) * u64::from(frame_height) < requested_pixels {
+                frame = Picture::Rgba(picture.to_rgba());
+            }
+        }
 
         // Build and emit one AVC420 surface update from a destination rectangle
         // and its pixel data. Shared by the no-regionRects fallback and the
@@ -1509,7 +1541,17 @@ impl GraphicsPipelineClient {
             // No region metadata: fall back to the single bounding-box update,
             // copying from the frame origin. This matches the pre-#2042 behavior
             // for streams that legitimately omit regionRects.
-            let cropped_data = crop_decoded_frame(frame.data(), frame.width(), frame.height(), dest_width, dest_height);
+            let cropped_data = match &frame {
+                Picture::Rgba(picture) => {
+                    crop_decoded_frame(picture.data(), frame_width, frame_height, dest_width, dest_height)
+                }
+                Picture::Yuv(picture) => picture.to_rgba_region(&ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: dest_width,
+                    bottom: dest_height,
+                }),
+            };
             emit_avc420(dest_rect.clone(), cropped_data);
             return Ok(());
         }
@@ -1518,8 +1560,8 @@ impl GraphicsPipelineClient {
             // Clip the region to the surface and the decoded frame so a
             // malformed or over-large rect cannot read out of bounds or paint
             // outside the surface.
-            let frame_w = u16::try_from(frame.width()).unwrap_or(u16::MAX);
-            let frame_h = u16::try_from(frame.height()).unwrap_or(u16::MAX);
+            let frame_w = u16::try_from(frame_width).unwrap_or(u16::MAX);
+            let frame_h = u16::try_from(frame_height).unwrap_or(u16::MAX);
             let clip_right = region.right.min(surface_bounds.0).min(frame_w);
             let clip_bottom = region.bottom.min(surface_bounds.1).min(frame_h);
             if region.left >= clip_right || region.top >= clip_bottom {
@@ -1553,7 +1595,10 @@ impl GraphicsPipelineClient {
 
             // Copy pixels (x, y) -> (x, y): the source in the decoded frame is the
             // region's own top-left, not the frame origin.
-            let data = copy_frame_region(frame.data(), frame.width(), &clipped);
+            let data = match &frame {
+                Picture::Yuv(picture) => picture.to_rgba_region(&clipped),
+                Picture::Rgba(picture) => copy_frame_region(picture.data(), frame_width, &clipped),
+            };
             emit_avc420(clipped, data);
         }
         Ok(())
