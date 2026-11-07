@@ -481,6 +481,8 @@ impl MonitorWindows {
                 }
             }
         }
+        // UNTESTED: Wayland frame callbacks must pace redraws; check live playback and resize.
+        view.window.pre_present_notify();
         let result = match region {
             Some(region) => buffer.present_with_damage(&[softbuffer::Rect {
                 x: u32::from(region.left),
