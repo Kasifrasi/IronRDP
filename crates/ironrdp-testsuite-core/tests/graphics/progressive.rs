@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use ironrdp_graphics::progressive::{DecodedTile, ProgressiveDecodeError, ProgressiveDecoder, encode_first_pass};
 use ironrdp_pdu::codecs::rfx::RfxRectangle;
 use ironrdp_pdu::codecs::rfx::progressive::{
@@ -50,6 +52,114 @@ fn region_error_preserves_tile_state_for_upgrades() {
         .expect("upgrades retain their tile state after a region error");
 
     assert_eq!(tile_pixels(recovered), tile_pixels(original));
+}
+
+#[test]
+fn one_pixel_region_rows_survive_clipping() {
+    // oracle: spec MS-RDPEGFX §2.2.4.2.1.5: rects defines the updated region, including one-pixel rows.
+    let component = encode_component(0);
+    let stream = tile_stream_with_rectangles(
+        simple_tiles(&component, 0),
+        vec![
+            RfxRectangle {
+                x: 0,
+                y: 0,
+                width: 6,
+                height: 2,
+            },
+            RfxRectangle {
+                x: 0,
+                y: 3,
+                width: 2,
+                height: 1,
+            },
+            RfxRectangle {
+                x: 4,
+                y: 3,
+                width: 2,
+                height: 1,
+            },
+        ],
+    );
+    let tiles = ProgressiveDecoder::new()
+        .decode_bitmap(1, 1, 512, 64, &stream)
+        .expect("decode thin regions");
+    let expected = (0..6)
+        .flat_map(|x| [(x, 0), (x, 1)])
+        .chain([(0, 3), (1, 3), (4, 3), (5, 3)])
+        .collect::<BTreeSet<_>>();
+    assert_eq!(updated_pixels(&tiles), expected);
+}
+
+#[test]
+fn one_pixel_region_columns_survive_clipping() {
+    // oracle: spec MS-RDPEGFX §2.2.4.2.1.5: rects defines the updated region, including one-pixel columns.
+    let component = encode_component(0);
+    let stream = tile_stream_with_rectangles(
+        simple_tiles(&component, 0),
+        vec![
+            RfxRectangle {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 6,
+            },
+            RfxRectangle {
+                x: 3,
+                y: 0,
+                width: 1,
+                height: 2,
+            },
+            RfxRectangle {
+                x: 3,
+                y: 4,
+                width: 1,
+                height: 2,
+            },
+        ],
+    );
+    let tiles = ProgressiveDecoder::new()
+        .decode_bitmap(1, 1, 512, 64, &stream)
+        .expect("decode thin columns");
+    let expected = (0..6)
+        .flat_map(|y| [(0, y), (1, y)])
+        .chain([(3, 0), (3, 1), (3, 4), (3, 5)])
+        .collect::<BTreeSet<_>>();
+    assert_eq!(updated_pixels(&tiles), expected);
+}
+
+#[test]
+fn thin_region_is_clipped_at_tile_and_surface_edges() {
+    // oracle: spec MS-RDPEGFX §2.2.4.2.1.5 and §3.3.1.6: only visible REGION pixels update the surface.
+    let component = encode_component(0);
+    let tiles = simple_tiles(&component, 0).into_iter().take(2).collect();
+    let stream = tile_stream_with_rectangles(
+        tiles,
+        vec![RfxRectangle {
+            x: 64,
+            y: 62,
+            width: 1,
+            height: 2,
+        }],
+    );
+    let decoded = ProgressiveDecoder::new()
+        .decode_bitmap(1, 1, 65, 63, &stream)
+        .expect("decode clipped surface edge");
+    assert_eq!(updated_pixels(&decoded), BTreeSet::from([(64, 62)]));
+    assert!(
+        decoded
+            .iter()
+            .flat_map(|tile| &tile.update_rectangles)
+            .all(|rect| rect.left < rect.right && rect.top < rect.bottom)
+    );
+}
+
+fn updated_pixels(tiles: &[DecodedTile]) -> BTreeSet<(u16, u16)> {
+    tiles
+        .iter()
+        .flat_map(|tile| &tile.update_rectangles)
+        .flat_map(|rect| (rect.top..rect.bottom).flat_map(move |y| (rect.left..rect.right).map(move |x| (x, y))))
+        .collect()
 }
 
 fn tile_pixels(tiles: Vec<DecodedTile>) -> Vec<(u16, u16, Vec<u8>)> {
@@ -129,6 +239,18 @@ fn simple_tiles(component: &[u8], flags: u8) -> Vec<ProgressiveTile<'_>> {
 }
 
 fn tile_stream(tiles: Vec<ProgressiveTile<'_>>) -> Vec<u8> {
+    tile_stream_with_rectangles(
+        tiles,
+        vec![RfxRectangle {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 64,
+        }],
+    )
+}
+
+fn tile_stream_with_rectangles(tiles: Vec<ProgressiveTile<'_>>, rects: Vec<RfxRectangle>) -> Vec<u8> {
     encode_progressive_stream(&[
         ProgressiveBlock::Sync(ProgressiveSyncPdu),
         ProgressiveBlock::Context(ProgressiveContextPdu {
@@ -142,12 +264,7 @@ fn tile_stream(tiles: Vec<ProgressiveTile<'_>>) -> Vec<u8> {
         }),
         ProgressiveBlock::Region(ProgressiveRegion {
             tile_size: 0x40,
-            rects: vec![RfxRectangle {
-                x: 0,
-                y: 0,
-                width: 512,
-                height: 64,
-            }],
+            rects,
             quant_vals: vec![ComponentCodecQuant::LOSSLESS],
             quant_prog_vals: vec![],
             flags: 0,
