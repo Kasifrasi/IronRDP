@@ -1,12 +1,85 @@
 use std::collections::BTreeSet;
 
-use ironrdp_graphics::progressive::{DecodedTile, ProgressiveDecodeError, ProgressiveDecoder, encode_first_pass};
+use ironrdp_graphics::progressive::{
+    DecodedTile, ProgressiveDecodeError, ProgressiveDecoder, decode_upgrade_pass, encode_first_pass,
+};
 use ironrdp_pdu::codecs::rfx::RfxRectangle;
 use ironrdp_pdu::codecs::rfx::progressive::{
     ComponentCodecQuant, ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
     ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TILE_FLAG_DIFFERENCE, TileSimple, TileUpgrade,
     encode_progressive_stream,
 };
+
+#[rstest::rstest]
+#[case::one_bit(1, &[1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1])]
+#[case::seven_bits(7, &[0x55, 0x73, 0x3d, 0x71, 0x11])]
+#[case::twelve_bits(12, &[0xabc, 0xdef, 0x123])]
+#[case::fifteen_bits(15, &[0x55e6, 0x7bc4])]
+fn raw_upgrades_read_magnitudes_across_byte_boundaries(#[case] bits: u8, #[case] expected: &[i16]) {
+    // oracle: spec MS-RDPEGFX §3.2.8.1.5.2.1 and §3.3.8.2.1.2: consecutive MSB-first fields.
+    let mut previous = ComponentCodecQuant::LOSSLESS;
+    previous.ll3 = bits;
+    let mut coefficients = [0i16; 4096];
+    let mut sign = [0i8; 4096];
+    decode_upgrade_pass(
+        &[],
+        &[0xab, 0xcd, 0xef, 0x12, 0x34],
+        &previous,
+        &ComponentCodecQuant::LOSSLESS,
+        false,
+        &mut coefficients,
+        &mut sign,
+    )
+    .expect("raw LL3 upgrades decode");
+
+    assert_eq!(&coefficients[4032..4032 + expected.len()], expected);
+}
+
+#[test]
+fn truncated_raw_upgrades_pad_partial_values_with_zeros() {
+    // oracle: mutant changing the existing zero-fill tolerance of a short raw stream.
+    let mut previous = ComponentCodecQuant::LOSSLESS;
+    previous.ll3 = 12;
+    let mut coefficients = [0i16; 4096];
+    let mut sign = [0i8; 4096];
+    decode_upgrade_pass(
+        &[],
+        &[0xab, 0xcd, 0xef, 0x12, 0x34],
+        &previous,
+        &ComponentCodecQuant::LOSSLESS,
+        false,
+        &mut coefficients,
+        &mut sign,
+    )
+    .expect("short raw upgrades retain zero-fill tolerance");
+
+    assert_eq!(coefficients[4035], 0x400);
+    assert_eq!(&coefficients[4036..], &[0; 60]);
+}
+
+#[test]
+fn raw_upgrades_preserve_wide_public_quantization_values() {
+    // oracle: mutant changing the low-32-bit behavior of unconstrained public quantization fields.
+    let mut previous = ComponentCodecQuant::LOSSLESS;
+    previous.ll3 = u8::MAX;
+    let mut raw = [0u8; 32];
+    raw[31] = 0x0e;
+    let mut coefficients = [0i16; 4096];
+    let mut sign = [0i8; 4096];
+    decode_upgrade_pass(
+        &[],
+        &raw,
+        &previous,
+        &ComponentCodecQuant::LOSSLESS,
+        false,
+        &mut coefficients,
+        &mut sign,
+    )
+    .expect("public quantization fields retain wide-count tolerance");
+
+    assert_eq!(coefficients[4032], 7);
+    assert_eq!(&coefficients[4033..], &[0; 63]);
+}
 
 #[test]
 fn region_error_preserves_references_for_difference_tiles() {
