@@ -3,12 +3,13 @@
 use anyhow::Context as _;
 use core::sync::atomic::{AtomicBool, Ordering};
 use ironrdp::client::output_channel::output_channel;
-use ironrdp::client::rdp::{RdpClient, RdpOutputEvent};
+use ironrdp::client::rdp::RdpClient;
 use ironrdp_daemon::daemon::{self, Daemon};
 use ironrdp_propertyset::PropertySet;
 use ironrdp_rpc::transport;
 use ironrdp_viewer::app::{App, RpcApp, ViewerEvent};
 use ironrdp_viewer::cli::ViewerConfig;
+use ironrdp_viewer::events::{OutputEvent, forward_output};
 use ironrdp_viewer::monitor::MonitorLayout;
 use ironrdp_viewer::startup::WindowedApp;
 use std::sync::Arc;
@@ -58,7 +59,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     debug!("Initialize App");
-    let mut event_loop_builder = EventLoop::<RdpOutputEvent>::with_user_event();
+    let mut event_loop_builder = EventLoop::<OutputEvent>::with_user_event();
     #[cfg(target_os = "linux")]
     if desktop_options
         .as_ref()
@@ -69,7 +70,7 @@ fn main() -> anyhow::Result<()> {
     }
     let event_loop = event_loop_builder.build()?;
     let event_loop_proxy = event_loop.create_proxy();
-    let (output_event_sender, mut output_event_receiver) = output_channel(64);
+    let (output_event_sender, output_event_receiver) = output_channel(64);
     // Native clipboard and device services stay on this thread until the event loop returns.
     #[cfg(windows)]
     let mut native_services = None;
@@ -123,21 +124,12 @@ fn main() -> anyhow::Result<()> {
             .build()
             .context("unable to create tokio runtime")?;
 
-        // Forward output events from the library's output channel to winit's `EventLoopProxy`.
-        //
-        // The library is winit-agnostic: it just emits `RdpOutputEvent`s on
-        // `output_channel`'s `OutputEventSender`/`OutputEventReceiver` pair (a plain
-        // `mpsc` channel for correctness-sensitive events, `watch` channels underneath
-        // for high-frequency display state; see `RdpOutputEvent::drop_policy`).
-        // Bridging onto the GUI event loop is the binary's job.
-        let output_forwarder = rt.spawn(async move {
-            while let Some(event) = output_event_receiver.recv().await {
-                if event_loop_proxy.send_event(event).is_err() {
-                    // The event loop is gone; nothing left to forward.
-                    break;
-                }
-            }
-        });
+        // Keep the native event queue bounded too, preserving every ordered desktop delta.
+        // UNTESTED: Native event-loop teardown must release queued permits to unblock forwarding.
+        // Check closing a busy viewer when changing this bridge; the tests use a channel instead of winit.
+        let output_forwarder = rt.spawn(forward_output(output_event_receiver, 64, move |event| {
+            event_loop_proxy.send_event(event).is_ok()
+        }));
 
         debug!("Start RDP thread");
         std::thread::spawn(move || {

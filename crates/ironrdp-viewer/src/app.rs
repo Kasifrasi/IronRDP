@@ -25,6 +25,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Cursor, CursorIcon, CustomCursor, Window, WindowAttributes};
 
 use crate::desktop::MonitorWindows;
+use crate::events::OutputEvent;
 use crate::keymap::{is_modifier, map_key_code};
 use crate::monitor::MonitorFocusState;
 use crate::rail::{RailWindows, bounded_window_size, window_point_to_desktop};
@@ -105,7 +106,7 @@ impl App {
     /// Creates the viewer; with `remote_app`, each RemoteApp window opens as a local window
     /// instead of a desktop window.
     pub fn new(
-        event_loop: &EventLoop<RdpOutputEvent>,
+        event_loop: &EventLoop<OutputEvent>,
         input_event_sender: &RdpInputSender,
         initial_window_size: PhysicalSize<u32>,
         remote_app: bool,
@@ -1161,7 +1162,7 @@ impl ApplicationHandler<ViewerEvent> for RpcApp {
     }
 }
 
-impl ApplicationHandler<RdpOutputEvent> for App {
+impl ApplicationHandler<OutputEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.inner.on_about_to_wait(event_loop);
     }
@@ -1174,8 +1175,8 @@ impl ApplicationHandler<RdpOutputEvent> for App {
         self.inner.on_window_event(event_loop, window_id, event);
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: RdpOutputEvent) {
-        self.inner.handle_output_event(event_loop, event);
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: OutputEvent) {
+        self.inner.handle_output_event(event_loop, event.event);
     }
 }
 
