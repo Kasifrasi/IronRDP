@@ -165,6 +165,7 @@ pub enum RdpOutputEvent {
     ///
     /// Routed through this same output channel (rather than a side-channel callback) so it is
     /// strictly ordered with respect to [`RdpOutputEvent::Connected`] and every other event.
+    /// Present the batch only after [`DesktopUpdate::is_batch_end`] returns `true`.
     DesktopUpdate(DesktopUpdate),
     ConnectionFailure(ironrdp_connector::ConnectorError),
     PointerDefault,
@@ -351,10 +352,11 @@ pub struct DesktopUpdate {
     width: NonZeroU16,
     height: NonZeroU16,
     region: InclusiveRectangle,
+    is_batch_end: bool,
 }
 
 impl DesktopUpdate {
-    /// Builds a validated desktop update.
+    /// Builds a validated desktop update that completes a one-update batch.
     #[must_use]
     pub fn new(buffer: Vec<u32>, width: NonZeroU16, height: NonZeroU16, region: InclusiveRectangle) -> Option<Self> {
         let region_width = region.right.checked_sub(region.left)?.checked_add(1)?;
@@ -368,6 +370,7 @@ impl DesktopUpdate {
             width,
             height,
             region,
+            is_batch_end: true,
         })
     }
 
@@ -391,9 +394,56 @@ impl DesktopUpdate {
         self.region.clone()
     }
 
+    /// Returns whether this update completes a batch that can be presented atomically.
+    pub fn is_batch_end(&self) -> bool {
+        self.is_batch_end
+    }
+
+    /// Marks whether this update completes its batch.
+    ///
+    /// Producers must bound the batch's pixel allocations and update metadata relative to a complete desktop snapshot.
+    #[must_use]
+    pub fn with_batch_end(mut self, is_batch_end: bool) -> Self {
+        self.is_batch_end = is_batch_end;
+        self
+    }
+
     /// Decomposes the update into its packed pixels, framebuffer extent, and region.
     pub fn into_parts(self) -> (Vec<u32>, NonZeroU16, NonZeroU16, InclusiveRectangle) {
         (self.buffer, self.width, self.height, self.region)
+    }
+}
+
+/// Stages desktop updates until a complete batch can be applied without presenting partial pixels.
+///
+/// Batch boundaries follow completed session processing, which can combine several graphics frames.
+/// The producer must bound each batch's pixel allocations and update metadata relative to a complete desktop snapshot.
+/// Clear incomplete updates when the connection is replaced or ends.
+#[derive(Debug, Default)]
+pub struct DesktopUpdateBatch {
+    updates: Vec<DesktopUpdate>,
+}
+
+impl DesktopUpdateBatch {
+    /// Stages an update and returns the complete batch after its final update arrives.
+    ///
+    /// A changed framebuffer extent discards incomplete updates from the previous extent.
+    pub fn push(&mut self, update: DesktopUpdate) -> Option<Vec<DesktopUpdate>> {
+        if self
+            .updates
+            .first()
+            .is_some_and(|previous| previous.width != update.width || previous.height != update.height)
+        {
+            self.clear();
+        }
+        let is_batch_end = update.is_batch_end();
+        self.updates.push(update);
+        is_batch_end.then(|| core::mem::take(&mut self.updates))
+    }
+
+    /// Discards incomplete updates and releases their allocations.
+    pub fn clear(&mut self) {
+        self.updates = Vec::new();
     }
 }
 
@@ -1261,6 +1311,7 @@ impl RdpClient {
     /// [`RdpOutputEvent::Image`] snapshots.
     ///
     /// The first update for each framebuffer extent covers the full framebuffer.
+    /// Use [`DesktopUpdateBatch`] to present each completed output batch together.
     /// Every event, including [`RdpOutputEvent::DesktopUpdate`], is delivered through the same
     /// output channel used for [`RdpOutputEvent::Connected`] and all other events, so relative
     /// ordering between them is preserved.
@@ -4540,12 +4591,38 @@ fn process_rdpdr_drive_change(
     }
 }
 
-fn pack_desktop_update(
-    image: &DecodedImage,
+fn desktop_damage_fits_snapshot(
     width: NonZeroU16,
     height: NonZeroU16,
-    region: InclusiveRectangle,
-) -> SessionResult<DesktopUpdate> {
+    regions: &[InclusiveRectangle],
+) -> SessionResult<bool> {
+    let snapshot_bytes = NonZeroUsize::from(width)
+        .get()
+        .checked_mul(NonZeroUsize::from(height).get())
+        .and_then(|pixels| pixels.checked_mul(size_of::<u32>()))
+        .and_then(|bytes| bytes.checked_add(size_of::<DesktopUpdate>()));
+    // Conservatively charge spare update-vector capacity, so tiny regions cannot amplify staging metadata.
+    let metadata_bytes = regions
+        .len()
+        .max(4)
+        .checked_mul(2)
+        .and_then(|updates| updates.checked_mul(size_of::<DesktopUpdate>()));
+    let mut damage_bytes = metadata_bytes;
+    for region in regions {
+        let (region_width, region_height) = desktop_update_dimensions(width, height, region)?;
+        damage_bytes = damage_bytes.and_then(|bytes| {
+            let pixel_bytes = region_width.checked_mul(region_height)?.checked_mul(size_of::<u32>())?;
+            bytes.checked_add(pixel_bytes)
+        });
+    }
+    Ok(matches!((damage_bytes, snapshot_bytes), (Some(damage), Some(snapshot)) if damage <= snapshot))
+}
+
+fn desktop_update_dimensions(
+    width: NonZeroU16,
+    height: NonZeroU16,
+    region: &InclusiveRectangle,
+) -> SessionResult<(usize, usize)> {
     let region_width = region
         .right
         .checked_sub(region.left)
@@ -4556,14 +4633,24 @@ fn pack_desktop_update(
         .checked_sub(region.top)
         .and_then(|height| height.checked_add(1))
         .ok_or_else(|| ironrdp_session::general_err!("invalid desktop update vertical bounds"))?;
-    if region.right >= width.get() || region.bottom >= height.get() {
+    if !(region.right < width.get() && region.bottom < height.get()) {
         return Err(ironrdp_session::general_err!(
             "desktop update exceeds framebuffer bounds"
         ));
     }
 
-    let pixel_count = usize::from(region_width)
-        .checked_mul(usize::from(region_height))
+    Ok((usize::from(region_width), usize::from(region_height)))
+}
+
+fn pack_desktop_update(
+    image: &DecodedImage,
+    width: NonZeroU16,
+    height: NonZeroU16,
+    region: InclusiveRectangle,
+) -> SessionResult<DesktopUpdate> {
+    let (row_pixel_count, region_height) = desktop_update_dimensions(width, height, &region)?;
+    let pixel_count = row_pixel_count
+        .checked_mul(region_height)
         .ok_or_else(|| ironrdp_session::general_err!("desktop update pixel count overflow"))?;
     let mut buffer = Vec::new();
     buffer
@@ -4572,7 +4659,6 @@ fn pack_desktop_update(
 
     let source_width = NonZeroUsize::from(width).get();
     let left = usize::from(region.left);
-    let row_pixel_count = usize::from(region_width);
     for y in region.top..=region.bottom {
         let pixel_offset = usize::from(y)
             .checked_mul(source_width)
@@ -5594,8 +5680,19 @@ async fn active_session(
                             if desktop_damage_regions.is_empty() {
                                 desktop_damage_regions.push(region);
                             }
-                            for region in desktop_damage_regions.drain(..) {
-                                let update = pack_desktop_update(&image, width, height, region)?;
+                            if !desktop_damage_fits_snapshot(width, height, &desktop_damage_regions)? {
+                                desktop_damage_regions.clear();
+                                desktop_damage_regions.push(InclusiveRectangle {
+                                    left: 0,
+                                    top: 0,
+                                    right: width.get() - 1,
+                                    bottom: height.get() - 1,
+                                });
+                            }
+                            let region_count = desktop_damage_regions.len();
+                            for (index, region) in desktop_damage_regions.drain(..).enumerate() {
+                                let update = pack_desktop_update(&image, width, height, region)?
+                                    .with_batch_end(index + 1 == region_count);
                                 if !send_active_output_event(
                                     output_event_sender,
                                     RdpOutputEvent::DesktopUpdate(update),
