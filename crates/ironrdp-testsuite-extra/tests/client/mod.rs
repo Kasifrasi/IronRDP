@@ -12,6 +12,7 @@ mod rail;
 mod remote_guard;
 mod resize;
 mod telemetry;
+mod udp_advertisement;
 mod viewer_events;
 mod viewer_monitor;
 mod viewer_rail;

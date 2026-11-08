@@ -2919,9 +2919,22 @@ fn build_connector(
     // Clone the connector config so we can apply runtime overrides before handing it to the
     // connector.  We want to set `enable_audio_playback` consistently with `channels.sound`.
     let mut connector_config = config.connector.clone();
+    let cluster_data = client_cluster_data(config, enable_udp);
     #[cfg(feature = "udp")]
     {
-        connector_config.multitransport_flags = reliable_udp_multitransport_flags(enable_udp);
+        connector_config.multitransport_flags =
+            reliable_udp_multitransport_flags(enable_udp && config.udp_advertisement_enabled());
+        if config.udp_advertisement.is_some() {
+            info!(
+                udp_enabled = config.udp_transport_enabled,
+                udp_eligible = enable_udp,
+                advertisement_requested = config.udp_advertisement_enabled(),
+                cluster_version = ?cluster_data.redirection_version,
+                cluster_flags = cluster_data.flags.bits(),
+                multitransport_flags = ?connector_config.multitransport_flags,
+                "UDP advertisement override"
+            );
+        }
     }
     #[cfg(not(feature = "udp"))]
     let _ = enable_udp;
@@ -3007,7 +3020,7 @@ fn build_connector(
         connector = connector.with_load_balance_info(load_balance_info.clone());
     }
 
-    connector = connector.with_cluster_data(client_cluster_data(config, enable_udp));
+    connector = connector.with_cluster_data(cluster_data);
 
     if !config.remote_guard_mode.is_enabled()
         && let Some(password_cookie) = config.redirection.as_ref().and_then(|hop| hop.password_cookie.clone())
@@ -6493,6 +6506,7 @@ fn process_clipboard_message(
 pub(crate) fn __test_build_connector(
     config: &Config,
     auto_reconnect_cookie: Option<&ServerAutoReconnect>,
+    enable_udp: bool,
 ) -> ConnectorResult<ironrdp_connector::ClientConnector> {
     #[cfg(feature = "clipboard")]
     let cliprdr_factory: CliprdrFactoryRef<'static> = None;
@@ -6514,7 +6528,7 @@ pub(crate) fn __test_build_connector(
         rdpdr_factory,
         RdpdrDevicePolicy::ALLOW_ALL,
         true,
-        false,
+        enable_udp,
         auto_reconnect_cookie,
     )
 }

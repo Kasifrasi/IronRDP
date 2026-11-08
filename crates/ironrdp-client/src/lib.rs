@@ -56,7 +56,15 @@ pub fn __test_build_connector(
     config: &config::Config,
     auto_reconnect_cookie: Option<&ironrdp_pdu::rdp::session_info::ServerAutoReconnect>,
 ) -> ironrdp_connector::ConnectorResult<ironrdp_connector::ClientConnector> {
-    rdp::__test_build_connector(config, auto_reconnect_cookie)
+    rdp::__test_build_connector(config, auto_reconnect_cookie, false)
+}
+
+#[cfg(all(feature = "__test", feature = "udp"))]
+#[doc(hidden)]
+pub fn __test_build_connector_with_udp(
+    config: &config::Config,
+) -> ironrdp_connector::ConnectorResult<ironrdp_connector::ClientConnector> {
+    rdp::__test_build_connector(config, None, true)
 }
 
 /// Routes input events as the active session does and returns the core input batch, if any, and the stage outputs.

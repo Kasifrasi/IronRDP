@@ -101,6 +101,8 @@ pub struct Config {
     #[cfg(feature = "udp")]
     pub(crate) udp_transport_enabled: bool,
     #[cfg(feature = "udp")]
+    pub(crate) udp_advertisement: Option<bool>,
+    #[cfg(feature = "udp")]
     pub(crate) udp_offer_version: UdpVersion,
     pub(crate) certificate_validation: ironrdp_tls::CertificateValidation,
     pub(crate) certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
@@ -186,6 +188,12 @@ impl Config {
     #[cfg(feature = "udp")]
     pub fn udp_transport_enabled(&self) -> bool {
         self.udp_transport_enabled
+    }
+
+    /// Whether reliable UDP and Soft-Sync are explicitly advertised when UDP is eligible.
+    #[cfg(feature = "udp")]
+    pub fn udp_advertisement_enabled(&self) -> bool {
+        self.udp_advertisement.unwrap_or(true)
     }
 
     /// Highest RDP-UDP protocol version offered in the SYN of the UDP handshake.
@@ -325,6 +333,8 @@ impl fmt::Debug for Config {
         s.field("transport", &self.transport);
         #[cfg(feature = "udp")]
         s.field("udp_transport_enabled", &self.udp_transport_enabled);
+        #[cfg(feature = "udp")]
+        s.field("udp_advertisement", &self.udp_advertisement);
         #[cfg(feature = "udp")]
         s.field("udp_offer_version", &self.udp_offer_version);
         s.field("certificate_validation", &self.certificate_validation);
@@ -1024,6 +1034,8 @@ pub struct ConfigBuilder {
     #[cfg(feature = "udp")]
     udp_transport_enabled: bool,
     #[cfg(feature = "udp")]
+    udp_advertisement: Option<bool>,
+    #[cfg(feature = "udp")]
     udp_offer_version: Option<UdpVersion>,
     graphics_pipeline: Option<bool>,
     #[cfg(feature = "vmconnect")]
@@ -1638,6 +1650,20 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_udp_transport(mut self, enabled: bool) -> Self {
         self.udp_transport_enabled = enabled;
+        self
+    }
+
+    /// Controls the optional Client Multitransport Channel Data block; enabled by default.
+    ///
+    /// Disabling this omits reliable UDP and Soft-Sync announcements without changing UDP eligibility or bootstrap policy.
+    /// The server's response can still change actual transport setup, routing, and timing.
+    /// See [MS-RDPBCGR] §2.2.1.3.8, "Client Multitransport Channel Data (TS_UD_CS_MULTITRANSPORT)".
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    #[cfg(feature = "udp")]
+    #[must_use]
+    pub fn with_udp_advertisement(mut self, enabled: bool) -> Self {
+        self.udp_advertisement = Some(enabled);
         self
     }
 
@@ -2793,6 +2819,8 @@ impl ConfigBuilder {
             transport,
             #[cfg(feature = "udp")]
             udp_transport_enabled: self.udp_transport_enabled,
+            #[cfg(feature = "udp")]
+            udp_advertisement: self.udp_advertisement,
             #[cfg(feature = "udp")]
             udp_offer_version: self.udp_offer_version.unwrap_or(UdpVersion::V3),
             certificate_validation,

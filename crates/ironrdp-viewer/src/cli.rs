@@ -202,6 +202,11 @@ struct Args {
     #[clap(long, env = "IRONRDP_UDP", value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, default_missing_value = "true")]
     udp: Option<bool>,
 
+    /// Advertise reliable UDP and Soft-Sync to the server; enabled by default.
+    /// Disabling this keeps UDP eligibility and setup policy, but server responses can change transport and timing.
+    #[clap(long, env = "IRONRDP_UDP_ADVERTISE", value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, default_missing_value = "true")]
+    udp_advertise: Option<bool>,
+
     /// Highest RDP-UDP protocol version to offer (1, 2 or 3). Requires --udp
     #[clap(long, env = "IRONRDP_UDP_OFFER", requires = "udp", value_parser = clap::value_parser!(u16).range(1..=3))]
     udp_offer: Option<u16>,
@@ -1117,6 +1122,9 @@ fn apply_cli_to_builder(
     }
     if let Some(enabled) = args.udp {
         builder = builder.with_udp_transport(enabled);
+    }
+    if let Some(enabled) = args.udp_advertise {
+        builder = builder.with_udp_advertisement(enabled);
     }
     if let Some(version) = args.udp_offer {
         use ironrdp::client::config::UdpVersion;
