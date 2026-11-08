@@ -141,6 +141,15 @@ pub fn encode_fastpath_input(events: &[FastPathInputEvent]) -> SessionResult<Vec
 }
 
 impl ActiveStage {
+    /// Resumes a continuous measurement opened on the main transport before activation.
+    ///
+    /// Pass the connector's start time and byte count once, before processing session frames.
+    /// Use the same monotonic clock for subsequent frame arrival times.
+    pub fn set_continuous_bandwidth_measurement(&mut self, started_at: MonotonicInstant, byte_count: u32) {
+        self.x224_processor
+            .set_continuous_bandwidth_measurement(started_at, byte_count);
+    }
+
     pub fn update_mouse_pos(&mut self, x: u16, y: u16) {
         self.fast_path_processor.update_mouse_pos(x, y);
     }

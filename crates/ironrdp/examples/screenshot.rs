@@ -442,6 +442,9 @@ fn active_stage(
         pointer_software_rendering: connection_result.pointer_software_rendering,
     }
     .build();
+    if let Some(measurement) = connection_result.continuous_bandwidth_measurement {
+        active_stage.set_continuous_bandwidth_measurement(measurement.started_at, measurement.byte_count);
+    }
     capture_frames(
         &mut framed,
         no_graphics_timeout,

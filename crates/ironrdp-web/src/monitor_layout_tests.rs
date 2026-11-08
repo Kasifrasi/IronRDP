@@ -188,6 +188,7 @@ async fn callback_receives_initial_changed_and_reactivated_layouts() {
             activation_factory: ConnectionActivationFactory::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID),
             compression_type: None,
             server_rdp_version: RdpVersion::V5_PLUS,
+            continuous_bandwidth_measurement: None,
         })),
     };
 

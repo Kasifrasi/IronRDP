@@ -23,15 +23,25 @@ use ironrdp_connector::{
     LicenseExchangeState, MonotonicInstant, Sequence as _, Written,
 };
 use ironrdp_core::{WriteBuf, encode_vec};
+use ironrdp_graphics::image_processing::PixelFormat;
+use ironrdp_pdu::Action;
+use ironrdp_pdu::gcc::RdpVersion;
 use ironrdp_pdu::mcs::{McsMessage, SendDataIndication};
 use ironrdp_pdu::rdp::autodetect::{AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu};
-use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags, ShareControlHeader, ShareControlPdu};
+use ironrdp_pdu::rdp::client_info::CompressionType;
+use ironrdp_pdu::rdp::finalization_messages::{ControlAction, ControlPdu, FontPdu, SequenceFlags, SynchronizePdu};
+use ironrdp_pdu::rdp::headers::{
+    BasicSecurityHeader, BasicSecurityHeaderFlags, CompressionFlags, ShareControlHeader, ShareControlPdu,
+    ShareDataHeader, ShareDataPdu, StreamPriority,
+};
 use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, RequestedProtocol};
 use ironrdp_pdu::rdp::server_license::{
     LicenseErrorCode, LicenseHeader, LicenseInformation, LicensePdu, LicensingErrorMessage, LicensingStateTransition,
     PreambleFlags, PreambleType, PreambleVersion,
 };
 use ironrdp_pdu::x224::X224;
+use ironrdp_session::image::DecodedImage;
+use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_testsuite_core::capsets::SERVER_DEMAND_ACTIVE;
 
 const USER_CHANNEL_ID: u16 = 1002;
@@ -381,15 +391,8 @@ fn connect_time_bandwidth_measured_window_reports_every_payload() {
     );
 }
 
-/// Continuous detection is not this phase's business. Its Starts and Stops belong
-/// to a different procedure in [MS-RDPBCGR] 3.2.5.14, answered on a multitransport
-/// channel, and the 0x0629 Stop needs a sequence-number correlation this phase
-/// does not track. A continuous Start must therefore not open a connect-time
-/// window, and a continuous Stop must not be answered as though it had.
-///
-/// The header size follows the same split: 2.2.14.1.4 sets `headerLength` to 0x08
-/// only for the 0x002B Stop and 0x06 otherwise, so counting a continuous Stop with
-/// the connect-time addend would be wrong on top of replying to it at all.
+/// Continuous requests must not produce connect-time results.
+/// Their counting rules and response type differ ([MS-RDPBCGR] 3.2.5.14), and a Stop before activation is ignored.
 #[test]
 fn continuous_bandwidth_measure_requests_are_not_answered_as_connect_time() {
     let mut connector = connect_time_autodetect_connector();
@@ -418,7 +421,7 @@ fn continuous_bandwidth_measure_requests_are_not_answered_as_connect_time() {
 
     assert!(
         matches!(connector.state, ClientConnectorState::ConnectTimeAutoDetection { .. }),
-        "the connector keeps listening after ignoring continuous-detection requests"
+        "the connector keeps listening after continuous-detection requests"
     );
 }
 
@@ -651,10 +654,8 @@ fn licensing_exchange_answers_an_autodetect_request_and_keeps_waiting() {
     );
 }
 
-/// The PDU an RDS host mixed into licensing, byte for byte (the trace in upstream
-/// IronRDP issue #1629): a Bandwidth Measure Start of the reliable UDP kind
-/// (0x0014), which the connect-time responder leaves alone. It is still no
-/// licensing PDU, so it must not end the connection.
+/// The PDU an RDS host mixed into licensing, byte for byte (the trace in upstream IronRDP issue #1629).
+/// This reliable Start (0x0014) must bypass the licensing decoder without opening a connect-time window.
 #[test]
 fn licensing_exchange_tolerates_the_autodetect_request_an_rds_host_mixes_in() {
     const SERVER_PDU: [u8; 10] = [
@@ -915,4 +916,203 @@ fn connect_time_bandwidth_measurement_spans_licensing_and_what_follows() {
         results.1, 1552,
         "the Payload received during licensing and the Stop are counted, each with its 8-byte header"
     );
+}
+
+fn server_activation_frames() -> Vec<Vec<u8>> {
+    let mut frames = vec![license_status_valid_client(), server_demand_active()];
+    frames.extend(
+        [
+            ShareDataPdu::Synchronize(SynchronizePdu {
+                target_user_id: USER_CHANNEL_ID,
+            }),
+            ShareDataPdu::Control(ControlPdu {
+                action: ControlAction::Cooperate,
+                grant_id: 0,
+                control_id: 0,
+            }),
+            ShareDataPdu::Control(ControlPdu {
+                action: ControlAction::GrantedControl,
+                grant_id: USER_CHANNEL_ID,
+                control_id: 1002,
+            }),
+            ShareDataPdu::FontMap(FontPdu {
+                number: 0,
+                total_number: 0,
+                flags: SequenceFlags::FIRST | SequenceFlags::LAST,
+                entry_size: 4,
+            }),
+        ]
+        .map(|share_data_pdu| {
+            server_send_data_indication(
+                IO_CHANNEL_ID,
+                encode_vec(&ShareControlHeader {
+                    share_control_pdu: ShareControlPdu::Data(ShareDataHeader {
+                        share_data_pdu,
+                        stream_priority: StreamPriority::Low,
+                        compression_flags: CompressionFlags::empty(),
+                        compression_type: CompressionType::K8,
+                    }),
+                    pdu_source: USER_CHANNEL_ID,
+                    share_id: SHARE_ID,
+                })
+                .unwrap(),
+            )
+        }),
+    );
+    frames
+}
+
+fn activate_connector(mut connector: ClientConnector, frames: &[Vec<u8>]) -> (ActiveStage, DecodedImage) {
+    // This fixture starts after Server Core Data would have been received.
+    connector.server_rdp_version = Some(RdpVersion::V5_PLUS);
+    let mut output = WriteBuf::new();
+    for frame in frames {
+        while connector.next_pdu_hint().is_none() {
+            output.clear();
+            connector.step(&[], None, &mut output).unwrap();
+        }
+        output.clear();
+        connector
+            .step(frame, Some(MonotonicInstant::from_millis(1_250)), &mut output)
+            .unwrap();
+    }
+    let result = connector.state.take_outcome().unwrap().into_connected().unwrap();
+    let image = DecodedImage::new(
+        PixelFormat::RgbA32,
+        result.desktop_size.width,
+        result.desktop_size.height,
+    );
+    let mut stage = ActiveStageBuilder {
+        static_channels: result.static_channels,
+        user_channel_id: result.user_channel_id,
+        io_channel_id: result.io_channel_id,
+        message_channel_id: result.message_channel_id,
+        share_id: result.share_id,
+        compression_type: result.compression_type,
+        enable_server_pointer: result.enable_server_pointer,
+        pointer_software_rendering: result.pointer_software_rendering,
+    }
+    .build();
+    if let Some(measurement) = result.continuous_bandwidth_measurement {
+        stage.set_continuous_bandwidth_measurement(measurement.started_at, measurement.byte_count);
+    }
+    (stage, image)
+}
+
+fn connector_autodetect(connector: &mut ClientConnector, request: AutoDetectRequest, millis: Option<u64>) -> Written {
+    let frame = server_send_data_indication(MESSAGE_CHANNEL_ID, encode_vec(&AutoDetectReqPdu::new(request)).unwrap());
+    connector
+        .step(&frame, millis.map(MonotonicInstant::from_millis), &mut WriteBuf::new())
+        .unwrap()
+}
+
+fn stop_continuous_measurement(stage: &mut ActiveStage, image: &mut DecodedImage) -> (u32, u32) {
+    let stop = server_send_data_indication(
+        MESSAGE_CHANNEL_ID,
+        encode_vec(&AutoDetectReqPdu::new(AutoDetectRequest::bw_stop_continuous(4))).unwrap(),
+    );
+    let responses = stage
+        .process(image, Action::X224, &stop, Some(MonotonicInstant::from_millis(1_500)))
+        .unwrap();
+    let [ActiveStageOutput::ResponseFrame(response)] = responses.as_slice() else {
+        panic!("expected one bandwidth response");
+    };
+    let mut response_buffer = WriteBuf::new();
+    response_buffer.write_slice(response);
+    decode_bandwidth_results(&response_buffer)
+}
+
+#[test]
+fn continuous_bandwidth_measurement_survives_connector_activation() {
+    let mut connector = licensing_exchange_connector();
+
+    // Accept an early reliable Start for compatibility, although MS-RDPBCGR §2.2.14.1.2 scopes it after connection.
+    connector_autodetect(&mut connector, AutoDetectRequest::bw_start_continuous(1), Some(1_000));
+    connector_autodetect(
+        &mut connector,
+        AutoDetectRequest::bw_payload(2, vec![0x5a; 32]),
+        Some(1_050),
+    );
+    let activation = server_activation_frames();
+    let (mut stage, mut image) = activate_connector(connector, &activation);
+    stage
+        .process(
+            &mut image,
+            Action::X224,
+            &rtt_request(3),
+            Some(MonotonicInstant::from_millis(1_400)),
+        )
+        .unwrap();
+
+    // oracle: spec MS-RDPBCGR §3.2.5.14 (continuous byte counting and elapsed time).
+    // Payload contributes 8 + 32, and active RTT and Stop contribute 6 each.
+    // Licensing contributes its 4-byte preamble, two 4-byte fields, and empty 4-byte blob header (§2.2.1.12.1.3).
+    // Demand Active and all four finalization frames have no Security Header, so their full lengths count once.
+    let expected_bytes = 40 + 16 + activation[1..].iter().map(Vec::len).sum::<usize>() + 6 + 6;
+    assert_eq!(
+        stop_continuous_measurement(&mut stage, &mut image),
+        (500, u32::try_from(expected_bytes).unwrap())
+    );
+}
+
+// oracle: mutant opening a continuous measurement without the caller supplying its start time.
+#[test]
+fn untimed_continuous_start_has_no_measurement_after_activation() {
+    let mut connector = licensing_exchange_connector();
+    connector_autodetect(&mut connector, AutoDetectRequest::bw_start_continuous(1), None);
+    let (mut stage, mut image) = activate_connector(connector, &server_activation_frames());
+
+    assert_eq!(stop_continuous_measurement(&mut stage, &mut image), (1, 0));
+}
+
+// oracle: spec MS-RDPBCGR §3.2.5.14 (a repeated Start clears both stores and restarts the timer).
+#[test]
+fn continuous_restart_before_activation_discards_the_first_measurement() {
+    let mut connector = licensing_exchange_connector();
+    connector_autodetect(&mut connector, AutoDetectRequest::bw_start_continuous(1), Some(1_000));
+    connector_autodetect(
+        &mut connector,
+        AutoDetectRequest::bw_payload(2, vec![0x5a; 32]),
+        Some(1_050),
+    );
+    connector_autodetect(&mut connector, AutoDetectRequest::bw_start_continuous(3), Some(1_200));
+    connector_autodetect(
+        &mut connector,
+        AutoDetectRequest::bw_payload(3, vec![0x5a; 7]),
+        Some(1_220),
+    );
+    let activation = server_activation_frames();
+    let (mut stage, mut image) = activate_connector(connector, &activation);
+
+    // Count only the new Payload (8 + 7), licensing (16), remaining activation frames, and Stop (6).
+    let expected_bytes = 15 + 16 + activation[1..].iter().map(Vec::len).sum::<usize>() + 6;
+    assert_eq!(
+        stop_continuous_measurement(&mut stage, &mut image),
+        (300, u32::try_from(expected_bytes).unwrap())
+    );
+}
+
+// oracle: spec MS-RDPBCGR §3.2.5.14 (a connect-time Start replaces the network characteristics stores).
+#[test]
+fn connect_time_start_cancels_the_continuous_measurement_before_activation() {
+    let mut connector = licensing_exchange_connector();
+    connector_autodetect(&mut connector, AutoDetectRequest::bw_start_continuous(1), Some(1_000));
+    connector_autodetect(&mut connector, AutoDetectRequest::bw_start_connect_time(2), Some(1_100));
+    let (mut stage, mut image) = activate_connector(connector, &server_activation_frames());
+
+    assert_eq!(stop_continuous_measurement(&mut stage, &mut image), (1, 0));
+}
+
+// oracle: mutant carrying a stopped connector measurement into the active session.
+#[test]
+fn continuous_stop_before_activation_does_not_leave_a_measurement_to_resume() {
+    let mut connector = licensing_exchange_connector();
+    connector_autodetect(&mut connector, AutoDetectRequest::bw_start_continuous(1), Some(1_000));
+    assert_eq!(
+        connector_autodetect(&mut connector, AutoDetectRequest::bw_stop_continuous(2), Some(1_100)),
+        Written::Nothing
+    );
+    let (mut stage, mut image) = activate_connector(connector, &server_activation_frames());
+
+    assert_eq!(stop_continuous_measurement(&mut stage, &mut image), (1, 0));
 }

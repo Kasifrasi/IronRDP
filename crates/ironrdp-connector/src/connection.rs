@@ -157,6 +157,17 @@ pub struct NetworkCharacteristics {
     pub average_rtt_ms: u32,
 }
 
+/// A continuous measurement awaiting completion on the main RDP transport.
+///
+/// Uses [MS-RDPBCGR 3.2.5.14], "Network Characteristics Detection", counting rules.
+///
+/// [MS-RDPBCGR 3.2.5.14]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/16ffa852-8aa7-481c-99a0-36c1a9a198f6
+#[derive(Debug)]
+pub struct ContinuousBandwidthMeasurement {
+    pub started_at: MonotonicInstant,
+    pub byte_count: u32,
+}
+
 #[derive(Debug)]
 pub struct ConnectionResult {
     pub io_channel_id: u16,
@@ -208,6 +219,8 @@ pub struct ConnectionResult {
     ///
     /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/379a020e-9925-4b4f-98f3-7d634e10b411
     pub server_rdp_version: gcc::RdpVersion,
+    /// An early continuous measurement to resume on the main transport after activation.
+    pub continuous_bandwidth_measurement: Option<ContinuousBandwidthMeasurement>,
 }
 
 impl ConnectionResult {
@@ -423,7 +436,7 @@ impl State for ClientConnectorState {
 
 #[expect(
     clippy::partial_pub_fields,
-    reason = "server response flags are negotiated internally and must not expand the public connector construction API; the connect-time bandwidth accumulators are likewise internal to the measurement, and exposing them would let a caller break the Start/Payload/Stop invariant"
+    reason = "negotiated server flags and in-flight measurements are internal connector state"
 )]
 #[derive(Debug)]
 pub struct ClientConnector {
@@ -467,6 +480,7 @@ pub struct ClientConnector {
     connect_time_bw_bytes: u32,
     /// Latest network characteristics reported during connection negotiation.
     network_characteristics: Option<NetworkCharacteristics>,
+    continuous_bandwidth_measurement: Option<ContinuousBandwidthMeasurement>,
     remote_guard: bool,
     remote_guard_ready: bool,
     // None disables NTLM; Some(None) binds it to the configured identity.
@@ -498,6 +512,7 @@ impl ClientConnector {
             connect_time_bw_started_at: None,
             connect_time_bw_bytes: 0,
             network_characteristics: None,
+            continuous_bandwidth_measurement: None,
             remote_guard: false,
             remote_guard_ready: false,
             #[cfg(feature = "remote-guard")]
@@ -1210,7 +1225,7 @@ impl ClientConnector {
     ) -> ConnectorResult<Written> {
         use ironrdp_pdu::rdp::autodetect::{
             AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu, BW_RESULTS_CONNECT_TIME, BW_START_CONNECT_TIME,
-            BW_STOP_CONNECT_TIME,
+            BW_START_RELIABLE_UDP, BW_STOP_CONNECT_TIME, BW_STOP_RELIABLE_UDP,
         };
 
         match request {
@@ -1222,21 +1237,25 @@ impl ClientConnector {
             // Start opens the measurement window ([MS-RDPBCGR] 2.2.14.1.2). No reply is
             // due; we only note when it arrived.
             //
-            // Only the connect-time variant belongs to this phase. [MS-RDPBCGR]
-            // 3.2.5.14 gives 0x0014 and 0x0114, the reliable and lossy UDP Starts, a
-            // different procedure: they accumulate every byte received rather than
-            // just the Bandwidth Measure messages, and they are answered on a
-            // multitransport channel. Opening a connect-time window for one would
-            // measure the wrong thing and answer on the wrong channel, so they are
-            // left alone here.
-            //
             // A driver that reports no arrival time cannot time this window, so it does
             // not open one. That keeps the two unmeasurable situations distinct: a
             // window that was timed and turned out to be short is still a measurement,
             // while a driver with no clock never took one.
             AutoDetectRequest::BandwidthMeasureStart { request_type, .. } if request_type == BW_START_CONNECT_TIME => {
+                self.continuous_bandwidth_measurement = None;
                 self.connect_time_bw_started_at = received_at;
                 self.connect_time_bw_bytes = 0;
+                Ok(Written::Nothing)
+            }
+            // Accept an early main-transport Start for compatibility, although §2.2.14.1.2 scopes it after connection.
+            AutoDetectRequest::BandwidthMeasureStart {
+                request_type: BW_START_RELIABLE_UDP,
+                ..
+            } => {
+                self.continuous_bandwidth_measurement = received_at.map(|started_at| ContinuousBandwidthMeasurement {
+                    started_at,
+                    byte_count: 0,
+                });
                 Ok(Written::Nothing)
             }
             // Payload carries the bytes whose transfer is being timed ([MS-RDPBCGR]
@@ -1342,19 +1361,16 @@ impl ClientConnector {
                 request_type,
                 ..
             } => {
+                if request_type == BW_STOP_RELIABLE_UDP {
+                    self.continuous_bandwidth_measurement = None;
+                }
                 warn!(
                     sequence_number,
                     request_type, "Unexpected Bandwidth Measure Stop requestType during the connection sequence"
                 );
                 Ok(Written::Nothing)
             }
-            // Other request types are informational or belong to continuous detection.
-            // In particular, this catches the continuous-detection Bandwidth Measure Start,
-            // answered on a multitransport channel under a different procedure.
-            // Reaching it here means a server started continuous detection before the
-            // connection sequence completed (Windows Server 2022 does, during
-            // licensing), which [MS-RDPBCGR] 3.2.5.14 does not provide for; ignoring is
-            // the conservative response.
+            // Ignore other bandwidth measurement start types on the main transport.
             _ => Ok(Written::Nothing),
         }
     }
@@ -1550,6 +1566,30 @@ impl Sequence for ClientConnector {
         received_at: Option<MonotonicInstant>,
         output: &mut WriteBuf,
     ) -> ConnectorResult<Written> {
+        if let Some(measurement) = self.continuous_bandwidth_measurement.as_mut()
+            && let Ok(ctx) = mcs::decode_send_data_indication(input)
+        {
+            // Licensing and message-channel PDUs carry a Security Header.
+            // Other supported I/O PDUs with zero flagsHi carry one too; Share Control pduType is nonzero.
+            let has_security_header = self.message_channel_id == Some(ctx.channel_id)
+                || matches!(
+                    self.state,
+                    ClientConnectorState::ConnectTimeAutoDetection { .. }
+                        | ClientConnectorState::LicensingExchange { .. }
+                )
+                || ctx.user_data.get(2..4) == Some([0, 0].as_slice());
+            let byte_count = if has_security_header {
+                ctx.user_data
+                    .len()
+                    .saturating_sub(rdp::headers::BasicSecurityHeader::FIXED_PART_SIZE)
+            } else {
+                input.len()
+            };
+            measurement.byte_count = measurement
+                .byte_count
+                .saturating_add(u32::try_from(byte_count).unwrap_or(u32::MAX));
+        }
+
         // A PDU on the message channel is none of the PDUs these phases wait for on the I/O
         // channel (a licensing PDU, a Share Control PDU); it is answered or ignored, and the
         // phase goes on waiting. See `step_message_channel_pdu`. Multitransport
@@ -2135,6 +2175,7 @@ impl Sequence for ClientConnector {
                                     .with_multitransport_soft_sync(self.soft_sync_negotiated()),
                                     compression_type: self.config.compression_type,
                                     server_rdp_version,
+                                    continuous_bandwidth_measurement: self.continuous_bandwidth_measurement.take(),
                                 },
                             }
                         }

@@ -34,6 +34,17 @@ struct BandwidthMeasurement {
 }
 
 impl AutoDetectResponder {
+    pub(crate) fn set_continuous_bandwidth_measurement(&mut self, started_at: MonotonicInstant, byte_count: u32) {
+        debug!(
+            started_at_ms = started_at.as_millis(),
+            byte_count, "Resuming continuous bandwidth measurement"
+        );
+        self.bandwidth = Some(BandwidthMeasurement {
+            started_at,
+            bytes: byte_count,
+        });
+    }
+
     /// Counts received bytes while a bandwidth window is open.
     pub(crate) fn record_bytes(&mut self, bytes: usize) {
         if let Some(measurement) = self.bandwidth.as_mut() {

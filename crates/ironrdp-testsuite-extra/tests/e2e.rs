@@ -377,6 +377,9 @@ async fn largest_fast_path_update(client_max_request_size: u32) -> usize {
                         pointer_software_rendering: connection_result.pointer_software_rendering,
                     }
                     .build();
+                    if let Some(measurement) = connection_result.continuous_bandwidth_measurement {
+                        stage.set_continuous_bandwidth_measurement(measurement.started_at, measurement.byte_count);
+                    }
 
                     display_tx
                         .send(DisplayUpdate::Bitmap(incompressible_frame(
@@ -987,6 +990,9 @@ async fn run_failing_display_probe(
             pointer_software_rendering: connection_result.pointer_software_rendering,
         }
         .build();
+        if let Some(measurement) = connection_result.continuous_bandwidth_measurement {
+            stage.set_continuous_bandwidth_measurement(measurement.started_at, measurement.byte_count);
+        }
         let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
 
         // The server closes the connection right after the display fails. Read until the reason, the end of
@@ -2477,7 +2483,7 @@ async fn client_server_with_display<D, DF, F, Fut, C>(
                 // Retain the connection activation factory so the client closure can drive its own
                 // Deactivation-Reactivation Sequence.
                 let activation_factory = connection_result.activation_factory;
-                let active_stage = ActiveStageBuilder {
+                let mut active_stage = ActiveStageBuilder {
                     static_channels: connection_result.static_channels,
                     user_channel_id: connection_result.user_channel_id,
                     io_channel_id: connection_result.io_channel_id,
@@ -2488,6 +2494,9 @@ async fn client_server_with_display<D, DF, F, Fut, C>(
                     pointer_software_rendering: connection_result.pointer_software_rendering,
                 }
                 .build();
+                if let Some(measurement) = connection_result.continuous_bandwidth_measurement {
+                    active_stage.set_continuous_bandwidth_measurement(measurement.started_at, measurement.byte_count);
+                }
                 let (active_stage, mut upgraded_framed) = clientfn(
                     active_stage,
                     activation_factory,
@@ -2658,6 +2667,9 @@ async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
                     pointer_software_rendering: connection_result.pointer_software_rendering,
                 }
                 .build();
+                if let Some(measurement) = connection_result.continuous_bandwidth_measurement {
+                    stage.set_continuous_bandwidth_measurement(measurement.started_at, measurement.byte_count);
+                }
                 stage.enable_reliable_udp_dvc_tunnel().expect("DRDYNVC is present");
                 let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
 
@@ -2900,6 +2912,9 @@ async fn egfx_windows(core_frame_ack_limit: Option<bool>) -> (u32, u32) {
                 pointer_software_rendering: connection_result.pointer_software_rendering,
             }
             .build();
+            if let Some(measurement) = connection_result.continuous_bandwidth_measurement {
+                stage.set_continuous_bandwidth_measurement(measurement.started_at, measurement.byte_count);
+            }
             let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
 
             // The server applies the window at activation, before it creates the
@@ -3182,7 +3197,7 @@ async fn connect_active_client(
     .await;
 
     let activation_factory = connection_result.activation_factory;
-    let active_stage = ActiveStageBuilder {
+    let mut active_stage = ActiveStageBuilder {
         static_channels: connection_result.static_channels,
         user_channel_id: connection_result.user_channel_id,
         io_channel_id: connection_result.io_channel_id,
@@ -3193,6 +3208,9 @@ async fn connect_active_client(
         pointer_software_rendering: connection_result.pointer_software_rendering,
     }
     .build();
+    if let Some(measurement) = connection_result.continuous_bandwidth_measurement {
+        active_stage.set_continuous_bandwidth_measurement(measurement.started_at, measurement.byte_count);
+    }
 
     (active_stage, activation_factory, upgraded_framed)
 }

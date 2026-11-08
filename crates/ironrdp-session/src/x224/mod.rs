@@ -159,6 +159,11 @@ impl Processor {
         self.share_id = share_id;
     }
 
+    pub(crate) fn set_continuous_bandwidth_measurement(&mut self, started_at: MonotonicInstant, byte_count: u32) {
+        self.auto_detect
+            .set_continuous_bandwidth_measurement(started_at, byte_count);
+    }
+
     /// Updates the negotiated maximum payload length of outgoing static virtual channel chunks.
     pub fn set_static_channel_chunk_size(&mut self, maximum_chunk_size: usize) -> bool {
         self.static_channels.set_maximum_chunk_size(maximum_chunk_size)

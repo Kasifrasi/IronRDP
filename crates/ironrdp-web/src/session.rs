@@ -1035,6 +1035,9 @@ impl iron_remote_desktop::Session for Session {
             pointer_software_rendering: connection_result.pointer_software_rendering,
         }
         .build();
+        if let Some(measurement) = connection_result.continuous_bandwidth_measurement {
+            active_stage.set_continuous_bandwidth_measurement(measurement.started_at, measurement.byte_count);
+        }
 
         // Timer interval for driving clipboard lock timeouts (5 second interval)
         let mut cleanup_interval = IntervalStream::new(5_000).fuse();

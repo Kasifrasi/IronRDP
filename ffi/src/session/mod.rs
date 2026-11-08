@@ -147,6 +147,9 @@ pub mod ffi {
                 pointer_software_rendering: connection_result.pointer_software_rendering,
             }
             .build();
+            if let Some(measurement) = connection_result.continuous_bandwidth_measurement {
+                stage.set_continuous_bandwidth_measurement(measurement.started_at, measurement.byte_count);
+            }
             stage.set_window_support_level(window_support_level);
 
             Ok(Box::new(ActiveStage(stage, activation_factory)))
