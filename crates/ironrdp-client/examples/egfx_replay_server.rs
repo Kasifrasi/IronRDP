@@ -10,14 +10,14 @@
     reason = "the diagnostic CLI reports connection and replay status"
 )]
 
+use core::net::Ipv4Addr;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write as _};
-use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::Context as _;
 use ironrdp_core::{Decode as _, Encode, EncodeResult, ReadCursor, WriteCursor, encode_vec, impl_as_any};
@@ -328,7 +328,7 @@ struct NoUpdates;
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for NoUpdates {
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
-        std::future::pending().await
+        core::future::pending().await
     }
 }
 
@@ -451,8 +451,8 @@ fn fixture(path: &Path, units: &[PathBuf]) -> anyhow::Result<()> {
         }),
     ];
     let mut messages: Vec<(u64, Vec<GfxPdu>)> = vec![(0, initial.to_vec())];
-    let count = if avc { units.len() } else { 2 };
-    for index in 0..count {
+    let raw_frames = core::iter::repeat_n(None, if avc { 0 } else { 2 });
+    for (index, unit) in units.iter().map(Some).chain(raw_frames).enumerate() {
         let frame_id = u32::try_from(index + 1)?;
         let timestamp = pdu::Timestamp {
             milliseconds: 0,
@@ -460,8 +460,8 @@ fn fixture(path: &Path, units: &[PathBuf]) -> anyhow::Result<()> {
             minutes: 0,
             hours: 0,
         };
-        let data = if avc {
-            let data = fs::read(&units[index])?;
+        let data = if let Some(unit) = unit {
+            let data = fs::read(unit)?;
             encode_vec(&pdu::Avc420BitmapStream {
                 rectangles: vec![rectangle.clone()],
                 quant_qual_vals: vec![pdu::QuantQuality {
