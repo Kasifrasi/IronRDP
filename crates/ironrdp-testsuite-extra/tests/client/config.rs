@@ -1385,6 +1385,21 @@ fn video_optimization_can_be_enabled_after_an_opt_out() {
     assert_eq!(config.properties().get::<i64>("videoplaybackmode"), Some(1));
 }
 
+// oracle: mutant an explicit video opt-out prevents a later playback-mode property from re-enabling video.
+#[test]
+fn video_property_can_enable_optimization_after_an_explicit_opt_out() {
+    let mut properties = ironrdp_propertyset::PropertySet::new();
+    properties.insert("videoplaybackmode", 1i64);
+    let config = complete_builder()
+        .with_video_optimized_remoting(false)
+        .with_property_set(&properties)
+        .unwrap()
+        .build()
+        .expect("video config");
+    assert!(config.channels().video.enabled);
+    assert_eq!(config.properties().get::<i64>("videoplaybackmode"), Some(1));
+}
+
 #[test]
 fn udp_and_graphics_pipeline_cli_flags_reach_the_config() {
     let rdp = "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\n";

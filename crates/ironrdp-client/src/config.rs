@@ -3119,8 +3119,8 @@ impl ConfigBuilder {
             _ => {}
         }
         #[cfg(feature = "video")]
-        if ps.get::<i64>("videoplaybackmode") == Some(0) {
-            self.channels.video.enabled = false;
+        if let Some(enabled) = ps.get::<i64>("videoplaybackmode") {
+            self.channels.video.enabled = enabled != 0;
         }
         #[cfg(feature = "camera")]
         if let Some(cameras) = ps.get::<&str>("camerastoredirect") {
