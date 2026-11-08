@@ -21,7 +21,7 @@ use ironrdp_svc::{
     ChannelFlags, StaticChannelSet, StaticVirtualChannel, SvcMessage, SvcProcessor, SvcProcessorMessages,
     client_encode_svc_messages_with_max_chunk_len,
 };
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::autodetect::AutoDetectResponder;
 use crate::{SessionError, SessionErrorExt as _, SessionResult, reason_err};
@@ -259,7 +259,7 @@ impl Processor {
                 if let Ok(X224(McsMessage::DisconnectProviderUltimatum(ultimatum))) =
                     decode::<X224<McsMessage<'_>>>(frame)
                 {
-                    debug!(reason = ?ultimatum.reason, "Received Disconnect Provider Ultimatum, session will be closed");
+                    info!(reason = ?ultimatum.reason, "Received Disconnect Provider Ultimatum, session will be closed");
 
                     return Ok(vec![ProcessorOutput::Disconnect(DisconnectDescription::McsDisconnect(
                         ultimatum.reason,
@@ -477,7 +477,7 @@ impl Processor {
                 Ok(vec![ProcessorOutput::Disconnect(desc)])
             }
             ShareDataPdu::ShutdownDenied => {
-                debug!("ShutdownDenied received, session will be closed");
+                info!("ShutdownDenied received, session will be closed");
 
                 // As defined in [MS-RDPBCGR], when `ShareDataPdu::ShutdownDenied` is received, we
                 // need to send a disconnect ultimatum to the server if we want to proceed with the

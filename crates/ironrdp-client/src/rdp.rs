@@ -971,6 +971,7 @@ impl RdpInputSender {
 
     /// Requests immediate session cancellation, bypassing the bounded input queue.
     pub fn request_close(&self) {
+        info!("Immediate session cancellation requested");
         self.close_sender.send_replace(true);
     }
 
@@ -980,6 +981,7 @@ impl RdpInputSender {
     /// sending the RDP Shutdown Request PDU. Use [`request_close`](Self::request_close) to
     /// immediately cancel a connection attempt or active session instead.
     pub fn request_graceful_close(&self) {
+        info!("Graceful session shutdown requested");
         self.graceful_close_sender.send_replace(true);
     }
 
@@ -1830,6 +1832,7 @@ impl RdpClient {
                     }
                 }
                 Ok(RdpControlFlow::TransportFailure(error)) => {
+                    warn!(%error, "Active session transport failed");
                     if self
                         .try_auto_reconnect(
                             auto_reconnect_policy,
@@ -1846,6 +1849,7 @@ impl RdpClient {
                     break;
                 }
                 Err(e) => {
+                    warn!(error = %e, "Active session failed");
                     if !self.send_output_event(RdpOutputEvent::Terminated(Err(e))).await {
                         self.emit_user_initiated_termination();
                     }

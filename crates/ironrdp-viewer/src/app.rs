@@ -586,6 +586,7 @@ impl RpcApp {
                 self.resize_timeout = Some(Instant::now() + Duration::from_secs(1));
             }
             WindowEvent::CloseRequested => {
+                info!(?window_id, "Desktop window close requested");
                 self.close_requested = true;
                 match &self.input_target {
                     InputTarget::Direct(input_event_sender) => input_event_sender.request_graceful_close(),
@@ -785,6 +786,7 @@ impl RpcApp {
                 }
             }
             WindowEvent::CloseRequested => {
+                info!(?window_id, "Desktop window close requested");
                 self.close_requested = true;
                 if let InputTarget::Direct(sender) = &self.input_target {
                     sender.request_graceful_close();
