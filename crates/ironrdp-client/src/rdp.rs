@@ -3257,13 +3257,18 @@ pub(crate) type ConnectOutput = (ConnectionOutcome, UpgradedFramed, UdpTunnel);
 /// Opens a TCP connection, abandoning each resolved address after `attempt_timeout`.
 async fn connect_tcp(dest: &str, attempt_timeout: Option<Duration>) -> io::Result<TcpStream> {
     let Some(attempt_timeout) = attempt_timeout else {
-        return TcpStream::connect(dest).await;
+        let stream = TcpStream::connect(dest).await?;
+        stream.set_nodelay(true)?;
+        return Ok(stream);
     };
 
     let mut last_error = None;
     for address in tokio::net::lookup_host(dest).await? {
         match tokio::time::timeout(attempt_timeout, TcpStream::connect(address)).await {
-            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Ok(stream)) => {
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
             Ok(Err(error)) => last_error = Some(error),
             Err(_) => {
                 last_error = Some(io::Error::new(
@@ -7248,6 +7253,35 @@ mod tests {
 
             drop(listener);
             assert!(connect_tcp(&address, Some(Duration::from_secs(5))).await.is_err());
+        });
+    }
+
+    #[test]
+    fn tcp_connect_disables_nagle_with_attempt_timeout() {
+        assert_tcp_connect_disables_nagle(Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn tcp_connect_disables_nagle_without_attempt_timeout() {
+        assert_tcp_connect_disables_nagle(None);
+    }
+
+    fn assert_tcp_connect_disables_nagle(attempt_timeout: Option<Duration>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind a loopback listener");
+            let address = listener.local_addr().expect("listener address").to_string();
+            let stream = connect_tcp(&address, attempt_timeout)
+                .await
+                .expect("connect to the loopback listener");
+
+            // oracle: reference FreeRDP 3.32.2 freerdp_tcp_default_connect enables TCP_NODELAY.
+            assert!(stream.nodelay().expect("read TCP_NODELAY"));
         });
     }
 
