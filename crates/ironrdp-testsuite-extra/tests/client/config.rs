@@ -1372,11 +1372,38 @@ fn video_property_can_reenable_optimization() {
 }
 
 #[test]
+fn viewer_network_defaults_match_freerdp() {
+    // oracle: reference FreeRDP 3.32.2 client defaults: ConnectionType 7 and SupportMultitransport enabled.
+    let config = parse_config_from_rdp(RDP_TARGET, &[]);
+
+    assert_eq!(
+        (config.connector().connection_type, config.udp_transport_enabled()),
+        (ironrdp_pdu::gcc::ConnectionType::Autodetect, true)
+    );
+}
+
+// oracle: reference CLI precedence model; explicit profile and UDP settings override viewer defaults.
+#[rstest::rstest]
+#[case::rdp_profile("connection type:i:6\n", &["--udp=false"], ironrdp_pdu::gcc::ConnectionType::Lan)]
+#[case::property_profile("connection type:i:6\n", &["--prop", "connection type:i:2", "--udp=false"], ironrdp_pdu::gcc::ConnectionType::BroadbandLow)]
+fn viewer_network_overrides_replace_defaults(
+    #[case] profile: &str,
+    #[case] extra_args: &[&str],
+    #[case] connection_type: ironrdp_pdu::gcc::ConnectionType,
+) {
+    let config = parse_config_from_rdp(&format!("{RDP_TARGET}{profile}"), extra_args);
+
+    assert_eq!(config.connector().connection_type, connection_type);
+    assert!(!config.udp_transport_enabled());
+}
+
+#[test]
 fn udp_and_graphics_pipeline_cli_flags_reach_the_config() {
     let rdp = "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\n";
 
     let config = parse_config_from_rdp(rdp, &[]);
-    assert!(!config.udp_transport_enabled());
+    // oracle: reference FreeRDP 3.32.2 enables multitransport by default.
+    assert!(config.udp_transport_enabled());
     assert_eq!(config.udp_offer_version(), UdpVersion::V3);
     assert_eq!(
         config.connector().support_dyn_vc_gfx_protocol,

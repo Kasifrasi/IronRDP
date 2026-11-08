@@ -198,7 +198,7 @@ struct Args {
     #[clap(long, value_enum, default_value_t = KeyboardType::IbmEnhanced)]
     keyboard_type: KeyboardType,
 
-    /// Enable reliable RDP-UDP for direct connections, falling back to TCP
+    /// Use reliable RDP-UDP for direct connections, falling back to TCP; enabled by default.
     #[clap(long, env = "IRONRDP_UDP", value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, default_missing_value = "true")]
     udp: Option<bool>,
 
@@ -869,7 +869,10 @@ impl ViewerConfig {
 
         // The library overlays everything expressible as a `.rdp` property: destination, credentials,
         // transport, channels, desktop size, audio, DVC proxies, etc.
-        let builder = ConfigBuilder::from_property_set(&properties)?;
+        let builder = ConfigBuilder::new()
+            .with_connection_type(ironrdp::pdu::gcc::ConnectionType::Autodetect)
+            .with_udp_transport(true)
+            .with_property_set(&properties)?;
 
         // Whether the `.rdp` file requested clipboard redirection; the CLI `--clipboard-type` is
         // resolved against this when applied below.
