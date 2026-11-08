@@ -1359,6 +1359,18 @@ fn video_playback_mode_zero_declines_video() {
     assert!(config.connector().support_dyn_vc_gfx_protocol);
 }
 
+// oracle: mutant a previous videoplaybackmode value prevents the next property set from re-enabling video.
+#[test]
+fn video_property_can_reenable_optimization() {
+    let mut properties = ironrdp_propertyset::PropertySet::new();
+    properties.insert("videoplaybackmode", 0i64);
+    let builder = complete_builder().with_property_set(&properties).unwrap();
+    properties.insert("videoplaybackmode", 1i64);
+    let config = builder.with_property_set(&properties).unwrap().build().unwrap();
+    assert!(config.channels().video.enabled);
+    assert_eq!(config.properties().get::<i64>("videoplaybackmode"), Some(1));
+}
+
 #[test]
 fn udp_and_graphics_pipeline_cli_flags_reach_the_config() {
     let rdp = "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\n";
