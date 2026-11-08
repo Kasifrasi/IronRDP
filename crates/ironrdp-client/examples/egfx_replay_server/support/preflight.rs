@@ -4,9 +4,9 @@
 //! It does not establish that compressed bitmap payloads are decodable or contain every reference
 //! picture or progressive tile they require: the receiving FreeRDP decoder performs that check.
 
+use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Context as _, bail, ensure};
 use ironrdp_client::graphics_capture::{CaptureEnd, CaptureReader};
@@ -514,7 +514,7 @@ fn validate_capability(cap: &RawCapabilitySet) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
