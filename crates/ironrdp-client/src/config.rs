@@ -2133,6 +2133,21 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable or disable MS-RDPEVOR video optimized remoting and its geometry tracking.
+    ///
+    /// This does not change the graphics pipeline or its H.264 decoder.
+    /// Accepting the video channels requires the `video` Cargo feature and an H.264 decoder.
+    /// The `videoplaybackmode` property is set even when that feature is disabled.
+    #[must_use]
+    pub fn with_video_optimized_remoting(mut self, enabled: bool) -> Self {
+        #[cfg(feature = "video")]
+        {
+            self.channels.video.enabled = enabled;
+        }
+        self.properties.insert("videoplaybackmode", i64::from(enabled));
+        self
+    }
+
     /// Cameras currently selected for redirection, e.g. from a `.rdp` file.
     #[cfg(feature = "camera")]
     pub fn cameras(&self) -> &crate::camera::CameraConfig {

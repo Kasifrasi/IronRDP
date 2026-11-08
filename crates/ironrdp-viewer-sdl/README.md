@@ -26,6 +26,8 @@ Ctrl+Alt+Enter toggles fullscreen for the focused window.
 The keyboard layout defaults to German; use `--keyboard-layout 1033` for US English.
 Switching away releases held keys and mouse buttons; input stays ordered when the client's queue is busy.
 Closing any monitor window ends the connection.
+`--no-video-optimization` keeps video on the graphics pipeline instead of accepting the separate video remoting channels; H.264 graphics remain available.
+For a bounded local graphics recording and playback in FreeRDP, see [Graphics recording and visible replay].
 
 Rendering follows [FreeRDP's SDL3 client]: persistent streaming textures, dirty-region uploads, persistent render targets, and disabled alpha blending for desktop pixels.
 Each renderer stores only its monitor's image on the GPU.
@@ -40,3 +42,4 @@ SDL_VIDEO_DRIVER=dummy SDL_RENDER_DRIVER=software \
 ```
 
 [FreeRDP's SDL3 client]: https://github.com/FreeRDP/FreeRDP/blob/master/client/SDL/SDL3/sdl_window.cpp
+[Graphics recording and visible replay]: ../ironrdp-client/README.md#graphics-recording-and-visible-replay

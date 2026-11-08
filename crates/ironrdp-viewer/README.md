@@ -113,6 +113,7 @@ Audio plays on the system default output device, followed when it changes; `--au
 
 The graphics pipeline (MS-RDPEGFX) is used by default with H.264, including AVC444, and MS-RDPEVOR video optimized remoting is accepted; both decode with the Windows H.264 decoder.
 Build with `--features openh264` to use the bundled OpenH264 sources instead (required on other platforms), and pass `--egfx=false` to keep graphics on the legacy bitmap path.
+For a bounded local graphics recording and playback in FreeRDP, see [Graphics recording and visible replay](../ironrdp-client/README.md#graphics-recording-and-visible-replay).
 
 To open the basic console of a local Hyper-V VM with the current Windows account:
 

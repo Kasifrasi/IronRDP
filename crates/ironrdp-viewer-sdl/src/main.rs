@@ -47,6 +47,9 @@ struct Options {
     /// Accept an untrusted server certificate.
     #[arg(long)]
     insecure: bool,
+    /// Keep video on the graphics pipeline instead of separate video remoting channels.
+    #[arg(long)]
+    no_video_optimization: bool,
 }
 
 struct Wake;
@@ -115,6 +118,9 @@ fn main() -> anyhow::Result<()> {
     }
     if options.insecure {
         builder = builder.with_certificate_validation(CertificateValidation::DangerouslyAcceptInvalidCertificate);
+    }
+    if options.no_video_optimization {
+        builder = builder.with_video_optimized_remoting(false);
     }
     let config = builder.build().context("invalid RDP configuration")?;
     let (output_sender, mut output_receiver) = output_channel(8);

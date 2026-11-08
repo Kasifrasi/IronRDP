@@ -1359,6 +1359,32 @@ fn video_playback_mode_zero_declines_video() {
     assert!(config.connector().support_dyn_vc_gfx_protocol);
 }
 
+// oracle: mutant disabling video optimized remoting also disables EGFX or its H.264 decoder.
+#[test]
+fn video_optimization_can_be_disabled_without_disabling_graphics() {
+    let config = complete_builder()
+        .with_h264_decoder(null_decoder())
+        .with_video_optimized_remoting(false)
+        .build()
+        .expect("graphics-only video config");
+    assert!(!config.channels().video.enabled);
+    assert!(config.channels().h264_decoder.is_some());
+    assert!(config.connector().support_dyn_vc_gfx_protocol);
+    assert_eq!(config.properties().get::<i64>("videoplaybackmode"), Some(0));
+}
+
+// oracle: mutant an earlier opt-out prevents the explicit video remoting setting from taking effect.
+#[test]
+fn video_optimization_can_be_enabled_after_an_opt_out() {
+    let config = complete_builder()
+        .with_video_optimized_remoting(false)
+        .with_video_optimized_remoting(true)
+        .build()
+        .expect("video config");
+    assert!(config.channels().video.enabled);
+    assert_eq!(config.properties().get::<i64>("videoplaybackmode"), Some(1));
+}
+
 #[test]
 fn udp_and_graphics_pipeline_cli_flags_reach_the_config() {
     let rdp = "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\n";

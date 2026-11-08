@@ -81,6 +81,7 @@ UDP sideband graphics processing is outside these primary-stream timing brackets
 Timing clocks are read only when the client target is enabled, and per-PDU log output can itself affect throughput; compare the same marked play, pause, and resume sequence with diagnostics disabled.
 Optional `IRONRDP_GFX_CAPTURE=/path/to/new.capture` also records decompressed EGFX messages for at most 60 seconds or 256 MiB; it adds synchronous file work and observes channel processing time rather than network arrival.
 Leave that variable unset for the initial timing run and for the uninstrumented comparison.
+See [Graphics recording and visible replay](#graphics-recording-and-visible-replay) for a controlled video comparison.
 
 The optional `telemetry` feature answers the MS-RDPET telemetry channel with one report per connection: the milliseconds from initiating the connection to opening the graphics pipeline channel and to receiving its first message.
 It is off by default; `ConfigBuilder::with_telemetry(true)` enables it.
@@ -104,6 +105,71 @@ The optional `pnp` feature redirects Plug and Play devices over MS-RDPEPNP with 
 No native backend exists: the embedder passes the device descriptions and a `PnpBackend` factory to `ConfigBuilder::with_pnp_redirection`.
 
 For the end-user RDP client binary, see [`ironrdp-viewer`](../ironrdp-viewer).
+
+## Graphics recording and visible replay
+
+The recording contains the original decompressed EGFX graphics messages, including graphics resets, surface creation, and codec payloads.
+It excludes the mouse pointer, audio, legacy bitmap updates and drawing orders, and separate video remoting channels.
+A visible replay can reproduce only the parts of the desktop delivered through EGFX.
+Keep the capture local: its graphics payloads can contain readable desktop content.
+
+1. Start the Vulkan viewer with a new local capture path and your existing connection file:
+
+   ```sh
+   IRONRDP_GFX_CAPTURE="$HOME/ironrdp-video.capture" \
+     cargo run --release -p ironrdp-viewer --features openh264 -- \
+     --rdp-file session.rdp --renderer wgpu \
+     --prop videoplaybackmode:i:0 --prop bitmapcachepersistenable:i:0 \
+     --prop audiomode:i:2 --prop audiocapturemode:i:0
+   ```
+
+   The example uses OpenH264 on Linux; Windows can use its default decoder.
+   The video property keeps video on the graphics pipeline while preserving H.264 and the viewer's usual graphics capabilities.
+   Disabling persistent caching avoids references to tiles from an earlier connection; do not add `--egfx-cache`.
+   Audio playback and microphone redirection are disabled for this comparison.
+   If disabling video optimized remoting changes the symptom, retain that result as a separate finding.
+   The environment assignment applies only to this invocation; existing files are never overwritten.
+
+2. After the connection opens, wait a few seconds, play the Windows video, pause until the image settles, and resume briefly.
+   Note the elapsed times of play, pause, and resume together with visible sharpness changes.
+   The capture contains no event markers.
+   Close the viewer normally.
+   Wait for its process to exit before replaying the file.
+   Stay within 60 seconds and 256 MiB, including the initial desktop traffic; the timer starts when the connector is created, before authentication finishes.
+   A single message is limited to 64 MiB.
+   Capture stops at a complete message boundary when a limit is reached, which can still leave a graphics frame without its end marker.
+   A normal close writes `Closed`; `Limit` identifies a bounded prefix, and `Checkpoint` identifies the last flushed message prefix if shutdown did not finish normally.
+   None of these markers alone proves that the last graphics frame is complete.
+   A truncated message or missing footer is an error, not a complete recording.
+   The replay server reports the end reason, warns for accepted prefixes, and rejects incomplete messages or frames.
+
+3. Serve the capture locally, then open it in an installed FreeRDP client from another terminal:
+
+   ```sh
+   cargo run --release -p ironrdp-client --example egfx_replay_server \
+     --features rustls -- --capture "$HOME/ironrdp-video.capture" --port 3390
+   ```
+
+   ```sh
+   xfreerdp /v:127.0.0.1:3390 /sec:tls /cert:ignore /u:replay /p:replay /gdi:sw /gfx:AVC420,AVC444,small-cache:on,progressive:on
+   ```
+
+   Some installations name the executable `xfreerdp3`.
+   The username and password are arbitrary local dummy values that avoid interactive credential prompts; the replay server neither requires nor checks Windows credentials.
+   AVC captures require a FreeRDP build with H.264 support.
+   These graphics options permit the recorded codecs; the capture determines the codec payloads, which are not re-encoded.
+   The replay server binds only to IPv4 loopback and uses an ephemeral self-signed TLS certificate; `/cert:ignore` is for this local server.
+   Recorded graphics payloads are forwarded unchanged; frames are neither dropped nor re-encoded.
+   Captured channel-processing intervals define the playback schedule rather than network arrival or video presentation timestamps.
+   Waiting for transport or frame acknowledgements can delay playback; `max_lateness_us` reports the maximum scheduling lateness.
+   This does not measure when FreeRDP presents a frame.
+   There are no interactive pause or seek controls.
+   The last output remains visible until FreeRDP disconnects; reconnect to replay from the beginning.
+   View at the recorded desktop's pixel size for a 1:1 comparison; scaling can change the apparent quality.
+   The server does not contact the original Windows host, and replay sends no input to it.
+
+For the SDL viewer, use `IRONRDP_GFX_CAPTURE="$HOME/ironrdp-video-sdl.capture" cargo run --release -p ironrdp-viewer-sdl --features openh264 -- server.example -u user --no-video-optimization` instead of step 1, then replay that path.
+SDL keeps audio disabled and requests AVC444 preference, so compare it separately from the Vulkan viewer's usual capability selection.
 
 ## Cloud discovery and browser handoff
 
