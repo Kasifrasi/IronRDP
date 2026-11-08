@@ -2901,6 +2901,7 @@ name = "ironrdp-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "futures-util",
  "ironrdp-cfg",
@@ -2943,6 +2944,7 @@ dependencies = [
  "ironrdp-rdpewa-native",
  "ironrdp-rdpsnd",
  "ironrdp-rdpsnd-native",
+ "ironrdp-server",
  "ironrdp-session",
  "ironrdp-svc",
  "ironrdp-tls",
@@ -2951,6 +2953,7 @@ dependencies = [
  "ironrdp-w365",
  "picky",
  "rand 0.9.5",
+ "rcgen",
  "reqwest",
  "rstest",
  "rustls-native-certs",
@@ -2958,6 +2961,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "url",
