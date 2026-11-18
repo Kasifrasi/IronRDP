@@ -132,44 +132,44 @@ fn version_three_syn_uses_the_cookie_hash_word_order_accepted_by_windows() {
     );
 }
 
+// oracle: reference FreeRDP/FreeRDP@5a10d7b6b79a:libfreerdp/core/rdpudp.c
 #[test]
-fn full_handshake_client_server() {
+fn version_three_starts_with_data_in_a_new_sequence_space() {
     let t = now();
-
-    // Step 1: Client sends SYN
-    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
+    let mut client = RdpeudpConnection::connect(default_config(4000), t).expect("connect");
     let syn_transmit = client.poll_transmit(t).expect("client SYN");
-
-    // Step 2: Server receives SYN and creates connection with SYN+ACK
     let syn_datagram: V1Datagram = decode(&syn_transmit.contents).expect("decode SYN");
-    let mut server = RdpeudpConnection::accept(default_config(200), &syn_datagram, t).expect("accept");
-    let syn_ack_transmit = server.poll_transmit(t).expect("server SYN+ACK");
-
-    // Step 3: Client receives SYN+ACK → transitions to Established
-    let mut syn_ack_bytes = syn_ack_transmit.contents;
+    let mut server = RdpeudpConnection::accept(default_config(60_000), &syn_datagram, t).expect("accept");
+    let mut syn_ack_bytes = server.poll_transmit(t).expect("server SYN+ACK").contents;
     client
         .handle_datagram(&mut syn_ack_bytes, later(t, 50))
         .expect("handle SYN+ACK");
 
-    assert!(client.is_established());
+    assert_eq!(client.poll_event(), Some(Event::Connected));
+    assert!(client.poll_transmit(later(t, 50)).is_none());
+    client.send(b"first data".to_vec()).expect("send");
+    let data = client.poll_transmit(later(t, 50)).expect("first client data");
+    let mut wire = data.contents.clone();
+    let (_, packet_bytes) = decode_with_prefix(&mut wire).expect("RDP-UDP2 prefix");
+    let packet: V2Packet = decode(packet_bytes).expect("first RDP-UDP2 packet");
+    assert_eq!(packet.header.flags.bits(), 0x314);
+    assert_eq!(packet.data_header.expect("data header").data_seq_num, 100);
+    assert_eq!(packet.data_body.expect("data body").channel_seq_num, 1);
+    assert_eq!(packet.ack_of_acks.expect("AckOfAcks").ack_of_acks_seq_num, 100);
+    assert_eq!(
+        packet.delay_ack_info,
+        Some(DelayAckInfoPayload {
+            max_delayed_acks: 1,
+            delayed_ack_timeout_ms: 20,
+        })
+    );
 
-    // Client should emit Connected event
-    let event = client.poll_event().expect("should have event");
-    assert_eq!(event, Event::Connected);
-
-    // Client sends final ACK
-    let ack_transmit = client.poll_transmit(later(t, 50)).expect("client final ACK");
-
-    // Step 4: Server receives final ACK → transitions to Established
-    let mut ack_bytes = ack_transmit.contents;
+    let mut wire = data.contents;
     server
-        .handle_datagram(&mut ack_bytes, later(t, 100))
-        .expect("handle final ACK");
-
-    assert!(server.is_established());
-
-    let event = server.poll_event().expect("should have event");
-    assert_eq!(event, Event::Connected);
+        .handle_datagram(&mut wire, later(t, 100))
+        .expect("handle first client data");
+    assert_eq!(server.poll_event(), Some(Event::Connected));
+    assert_eq!(server.poll_event(), Some(Event::DataReceived(b"first data".to_vec())));
 }
 
 /// End-to-end handshake AND data exchange for the server-accept role
@@ -330,10 +330,7 @@ fn accept_rejects_an_out_of_range_log_window_size() {
 
 // ── Data transfer tests ──
 
-/// Drive a full handshake for `client_config` against a server with
-/// `server_isn`, through the final ACK, without draining either side's event
-/// queue: `poll_event()` is a separate queue from `poll_transmit()`, so
-/// callers are free to drain it (or assert on it) however they need.
+/// Establish both sides and leave their Connected events queued.
 fn handshake(
     client_config: ConnectionConfig,
     server_isn: u32,
@@ -352,33 +349,39 @@ fn handshake(
         .handle_datagram(&mut syn_ack_bytes, later(t, 50))
         .expect("handle SYN+ACK");
 
-    let final_ack = client.poll_transmit(later(t, 50)).expect("final ACK");
-    let mut ack_bytes = final_ack.contents;
+    if client.v1_stats().is_none() {
+        client.send(b"handshake data".to_vec()).expect("initial data");
+    }
+    let mut response = client.poll_transmit(later(t, 50)).expect("handshake response").contents;
     server
-        .handle_datagram(&mut ack_bytes, later(t, 100))
-        .expect("handle ACK");
+        .handle_datagram(&mut response, later(t, 100))
+        .expect("complete server handshake");
 
     (client, server, t)
 }
 
 /// Helper: perform a full handshake and return (client, server, time).
 fn establish_pair() -> (RdpeudpConnection, RdpeudpConnection, MonotonicInstant) {
-    let (mut client, mut server, t) = handshake(default_config(100), 200);
+    let (mut client, mut server, _) = handshake(default_config(100), 200);
     while client.poll_event().is_some() {}
     while server.poll_event().is_some() {}
-    (client, server, t)
+    let ack_deadline = server.poll_timeout().expect("ACK timer");
+    server.handle_timeout(ack_deadline);
+    let mut ack = server.poll_transmit(ack_deadline).expect("initial data ACK").contents;
+    client.handle_datagram(&mut ack, ack_deadline).expect("handle ACK");
+    (client, server, ack_deadline)
 }
 
 /// Each side's handshake round trip seeds its RTT estimate, rather than
 /// leaving it unset until the first data-phase ACK.
 #[test]
 fn handshake_seeds_rtt_estimate() {
-    let (client, server, _t) = establish_pair();
+    let (client, server, _t) = handshake(default_config(100), 200);
 
     // Client: SYN sent at t=0, SYN+ACK handled at t=50.
     assert_eq!(client.srtt(), Some(Duration::from_millis(50)));
 
-    // Server: SYN+ACK sent at t=0 (inside `accept`), final ACK handled at t=100.
+    // Server: SYN+ACK sent at t=0, first data received at t=100.
     assert_eq!(server.srtt(), Some(Duration::from_millis(100)));
 }
 
@@ -812,7 +815,12 @@ fn a_repeated_syn_draws_another_syn_ack() {
 fn a_repeated_syn_ack_draws_another_final_ack() {
     let t = now();
 
-    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
+    let config = ConnectionConfig {
+        offer_version: UdpVersion::V2,
+        cookie_hash: None,
+        ..default_config(100)
+    };
+    let mut client = RdpeudpConnection::connect(config, t).expect("connect");
     let syn = client.poll_transmit(t).expect("SYN");
     let syn_dg: V1Datagram = decode(&syn.contents).expect("decode SYN");
 
@@ -828,8 +836,7 @@ fn a_repeated_syn_ack_draws_another_final_ack() {
     let final_ack = client.poll_transmit(later(t, 50)).expect("final ACK");
     assert!(client.is_established());
 
-    // That ACK was lost, so the server repeats its SYN+ACK. The client is on
-    // v2 by now and must still recognise it.
+    // The server repeats its SYN+ACK after the final ACK is lost.
     let mut repeated = syn_ack.contents;
     client
         .handle_datagram(&mut repeated, later(t, 600))
@@ -1099,10 +1106,8 @@ fn an_out_of_range_cumulative_ack_does_not_discard_outstanding_data() {
 /// window, so the timing has to be read before that happens. Reading it after
 /// finds nothing and no sample reaches the estimator from this exchange.
 ///
-/// The handshake round trip already seeded the estimator (see
-/// `handshake_seeds_rtt_estimate`), so this data-phase acknowledgment is the
-/// *second* sample: it refines the existing estimate rather than setting it
-/// from nothing.
+/// The client already has an RTT estimate from setup.
+/// This data-phase acknowledgment must refine it.
 #[test]
 fn an_acknowledgement_produces_an_rtt_sample() {
     let (mut client, mut server, t) = establish_pair();

@@ -852,7 +852,7 @@ async fn accept_udp_after_initial_datagram<S: DatagramIo>(
     // if they fail rather than detaching it.
     let mut driver_handle = AbortOnDrop::new(tokio::spawn(async move { driver.run().await }));
 
-    // Wait for the RDPEUDP2 handshake to complete (ACK received), racing
+    // Wait for the UDP handshake to complete (ACK or first data received), racing
     // against the driver task exiting early with its real cause. Without
     // this race, a driver that dies here blocks on a Notify that will never
     // fire: nothing bounds this wait on its own, so the caller only finds

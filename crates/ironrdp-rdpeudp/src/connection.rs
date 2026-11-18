@@ -9,16 +9,16 @@
 //!
 //! ```text
 //! Client: connect() → SynSent ──(recv SYN+ACK)──→ Established
-//! Server: accept()  → SynReceived ──(recv ACK)──→ Established
+//! Server: accept()  → SynReceived ──(recv ACK or RDP-UDP2 data)──→ Established
 //! Either: close()   → Closed
 //! Either: idle timeout ──→ Closed
 //! ```
 //!
 //! # V1/V2 packet discrimination
 //!
-//! The v1 wire format is used for the three-way handshake (SYN/SYN+ACK/ACK).
-//! Once established, all packets use the v2 format with the PacketPrefixByte
-//! framing from MS-RDPEUDP2 Section 2.2.1.3.
+//! The SYN and SYN+ACK use the MS-RDPEUDP format.
+//! Versions 1 and 2 retain that format for the final ACK and data transfer.
+//! Version 3 switches to MS-RDPEUDP2 after the SYN+ACK.
 
 use crate::time::MonotonicInstant;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -32,13 +32,13 @@ use tracing::{debug, trace, warn};
 use crate::congestion::CongestionControl;
 use crate::error::{RdpeudpError, RdpeudpErrorExt as _, SendError};
 use crate::loss::LossDetector;
-use crate::pdu::prefix::{decode_with_prefix, encode_with_prefix};
+use crate::pdu::prefix::{PacketPrefixByte, decode_with_prefix, encode_with_prefix};
 use crate::pdu::v1_ack::{V1AckVectorElement, V1AckVectorHeader, VectorElementState};
 use crate::pdu::v1_flags::V1Flags;
 use crate::pdu::v1_header::FecHeader;
 use crate::pdu::v1_syn::{SynDataExPayload, SynDataPayload, SynExFlags, UdpVersion};
 use crate::pdu::v2_ack::{ACK_VECTOR_MAX_ENTRIES, AckPayload, AckVectorEntry, AckVectorPayload};
-use crate::pdu::v2_control::AckOfAcksPayload;
+use crate::pdu::v2_control::{AckOfAcksPayload, DelayAckInfoPayload};
 use crate::pdu::v2_data::{DataBody, DataHeader};
 use crate::pdu::v2_flags::V2Flags;
 use crate::pdu::v2_header::{LOG_WINDOW_SIZE_MAX, V2Header};
@@ -171,6 +171,9 @@ impl Default for ConnectionConfig {
 /// so the effective limit is whichever of the two is smaller.
 const RDPEUDP2_MTU: usize = 1232;
 
+/// Windows starts RDP-UDP2 data numbering at 100 independently of the SYN.
+const RDPEUDP2_INITIAL_DATA_SEQ: u64 = 100;
+
 /// What a data packet spends on framing before any payload: the
 /// PacketPrefixByte (1), the RDP-UDP2 header (2), the DataHeader (2) and the
 /// DataBody's ChannelSeqNum (2).
@@ -181,7 +184,7 @@ const DATA_PACKET_OVERHEAD: usize = 7;
 /// The largest is an ACK vector: three bytes fixed, four for the timestamp
 /// block, and up to 127 entries, that being the limit of its 7-bit size field.
 /// The cumulative form reaches 22 and cannot appear beside it, since 2.2.1.1
-/// makes the two flags mutually exclusive. An AckOfAcks adds two more.
+/// makes the two flags mutually exclusive. AckOfAcks adds two bytes and DelayAckInfo adds three.
 ///
 /// Reserving the worst case costs about a tenth of each packet on a link with
 /// nothing to report. Measuring instead, and dropping the acknowledgment when
@@ -189,7 +192,7 @@ const DATA_PACKET_OVERHEAD: usize = 7;
 /// packet to be built; not worth it until something shows the throughput
 /// matters. `a_full_data_packet_fits_the_mtu` checks this figure against the
 /// encoders rather than leaving it as arithmetic in a comment.
-const PIGGYBACK_RESERVE: usize = 134 + 2;
+const PIGGYBACK_RESERVE: usize = 134 + 2 + 3;
 
 /// How many unanswered retransmits of a handshake datagram we tolerate
 /// before closing.
@@ -783,13 +786,14 @@ impl RdpeudpConnection {
         let state = self.state;
         let result = match self.state {
             State::SynSent => self.handle_syn_ack(wire, now),
-            State::SynReceived => self.handle_final_ack(wire, now),
+            State::SynReceived => self.complete_server_handshake(wire, now),
             State::Established => {
-                // A server that missed our final ACK repeats its SYN+ACK, in
-                // the v1 format, long after we have moved on to v2.
+                // A server waiting for the client's first response can repeat its SYN+ACK.
                 if self.is_repeated_syn_ack(wire) {
-                    debug!("Server repeated SYN+ACK, resending final ACK");
-                    self.resend_handshake_datagram();
+                    if self.wire_is_v1() {
+                        debug!("Server repeated SYN+ACK, resending final ACK");
+                        self.resend_handshake_datagram();
+                    }
                     return Ok(());
                 }
 
@@ -1307,8 +1311,10 @@ impl RdpeudpConnection {
         // Karn's-algorithm check `sample_handshake_rtt` relies on.
         self.sample_handshake_rtt(now);
 
-        // Send final ACK to complete handshake
-        self.enqueue_final_ack(remote_isn);
+        // Windows expects RDP-UDP2 data immediately after selecting version 3.
+        if self.wire_is_v1() {
+            self.enqueue_final_ack(remote_isn);
+        }
 
         // Transition to established
         self.transition_to_established(now);
@@ -1316,7 +1322,34 @@ impl RdpeudpConnection {
         Ok(())
     }
 
-    /// Server receives the client's final ACK.
+    fn complete_server_handshake(&mut self, wire: &mut [u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
+        if self.wire_is_v1() {
+            return self.handle_final_ack(wire, now);
+        }
+
+        if let Ok(header) = decode::<FecHeader>(wire)
+            && header.sn_source_ack == u32::MAX
+            && header.flags.contains(V1Flags::SYN)
+            && !header.flags.contains(V1Flags::ACK)
+        {
+            return self.handle_final_ack(wire, now);
+        }
+
+        let (prefix, packet_bytes) = decode_with_prefix(wire).map_err(RdpeudpError::prefix)?;
+        let packet: V2Packet = decode(packet_bytes).map_err(RdpeudpError::decode)?;
+        if !packet.header.flags.contains(V2Flags::DATA) {
+            return Err(RdpeudpError::invalid_packet(
+                "complete server handshake",
+                "expected RDP-UDP2 data during handshake",
+            ));
+        }
+
+        self.sample_handshake_rtt(now);
+        self.transition_to_established(now);
+        self.process_v2_packet(prefix, &packet, now);
+        Ok(())
+    }
+
     fn handle_final_ack(&mut self, wire: &[u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
         let datagram: V1Datagram = decode(wire).map_err(RdpeudpError::decode)?;
 
@@ -1402,10 +1435,8 @@ impl RdpeudpConnection {
         self.state = State::Established;
         self.timers.clear(Timer::Retransmit);
 
-        // The client keeps its final ACK: nothing acknowledges that ACK, so
-        // the only sign it was lost is the server repeating its SYN+ACK. The
-        // server, having just received that ACK, has nothing left to repeat.
-        if self.side == Side::Server {
+        // Only a version 1 or 2 client can still need to replay its final ACK.
+        if self.side == Side::Server || !self.wire_is_v1() {
             self.handshake_datagram = None;
         }
 
@@ -1414,19 +1445,18 @@ impl RdpeudpConnection {
             .as_ref()
             .expect("params must be set before transitioning to established");
 
-        // Data sequence numbers start at ISN + 1
-        let local_initial_data_seq = u64::from(params.local_isn) + 1;
-        let remote_initial_data_seq = u64::from(params.remote_isn) + 1;
-
-        // MS-RDPEUDP2 numbers channel data from 1. MS-RDPEUDP (3.1.1.2) has a single
-        // Source sequence space starting at the ISN + 1, so both windows use it.
-        let (local_initial_channel_seq, remote_initial_channel_seq) = match params.wire {
-            WireFormat::V1 { .. } => (local_initial_data_seq, remote_initial_data_seq),
-            WireFormat::V2 => (1u64, 1u64),
+        let (local_data_seq, remote_data_seq, local_channel_seq, remote_channel_seq) = match params.wire {
+            WireFormat::V1 { .. } => {
+                let local = u64::from(params.local_isn) + 1;
+                let remote = u64::from(params.remote_isn) + 1;
+                self.v1_next_coded = params.local_isn.wrapping_add(1);
+                (local, remote, local, remote)
+            }
+            WireFormat::V2 => {
+                self.pending_ack_of_acks = Some(RDPEUDP2_INITIAL_DATA_SEQ);
+                (RDPEUDP2_INITIAL_DATA_SEQ, RDPEUDP2_INITIAL_DATA_SEQ, 1, 1)
+            }
         };
-        if let WireFormat::V1 { .. } = params.wire {
-            self.v1_next_coded = params.local_isn.wrapping_add(1);
-        }
 
         debug!(
             side = ?self.side,
@@ -1439,14 +1469,14 @@ impl RdpeudpConnection {
         );
 
         self.send_window = Some(SendWindow::new(
-            local_initial_data_seq,
-            local_initial_channel_seq,
+            local_data_seq,
+            local_channel_seq,
             params.log_window_size,
         ));
 
         self.recv_window = Some(RecvWindow::new(
-            remote_initial_data_seq,
-            remote_initial_channel_seq,
+            remote_data_seq,
+            remote_channel_seq,
             params.log_window_size,
         ));
 
@@ -1463,9 +1493,12 @@ impl RdpeudpConnection {
     /// Process a v2 wire-format packet (with prefix byte framing).
     fn handle_v2_packet(&mut self, wire: &mut [u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
         let (prefix, packet_bytes) = decode_with_prefix(wire).map_err(RdpeudpError::prefix)?;
-
         let packet: V2Packet = decode(packet_bytes).map_err(RdpeudpError::decode)?;
+        self.process_v2_packet(prefix, &packet, now);
+        Ok(())
+    }
 
+    fn process_v2_packet(&mut self, prefix: PacketPrefixByte, packet: &V2Packet, now: MonotonicInstant) {
         trace!(
             flags = ?packet.header.flags,
             dummy = prefix.is_dummy(),
@@ -1500,8 +1533,6 @@ impl RdpeudpConnection {
                 self.process_data(dh, db, now);
             }
         }
-
-        Ok(())
     }
 
     /// Process a cumulative ACK payload.
@@ -2002,7 +2033,7 @@ impl RdpeudpConnection {
 
         let log_window_size = self.params.as_ref()?.log_window_size;
 
-        let mut flags = V2Flags::DATA;
+        let mut flags = V2Flags::DATA | V2Flags::DELAYACKINFO;
 
         // Piggyback an acknowledgment if one is pending
         let mut acknowledged = false;
@@ -2018,6 +2049,9 @@ impl RdpeudpConnection {
         } else {
             (None, None)
         };
+        if !acknowledged {
+            flags |= V2Flags::NOACK;
+        }
 
         // AckOfAcks if pending
         let ack_of_acks = self.pending_ack_of_acks.map(|seq| AckOfAcksPayload {
@@ -2031,7 +2065,10 @@ impl RdpeudpConnection {
             header: V2Header { flags, log_window_size },
             ack,
             overhead_size: None,
-            delay_ack_info: None,
+            delay_ack_info: Some(DelayAckInfoPayload {
+                max_delayed_acks: 1,
+                delayed_ack_timeout_ms: 20,
+            }),
             ack_of_acks,
             data_header: Some(DataHeader {
                 data_seq_num: seq::truncate_seq(data_seq),
@@ -2710,12 +2747,15 @@ mod tests {
 
         let packet = V2Packet {
             header: V2Header {
-                flags: V2Flags::DATA | V2Flags::ACKVEC | V2Flags::AOA,
+                flags: V2Flags::DATA | V2Flags::ACKVEC | V2Flags::AOA | V2Flags::DELAYACKINFO,
                 log_window_size: 6,
             },
             ack: None,
             overhead_size: None,
-            delay_ack_info: None,
+            delay_ack_info: Some(DelayAckInfoPayload {
+                max_delayed_acks: 1,
+                delayed_ack_timeout_ms: 20,
+            }),
             ack_of_acks: Some(AckOfAcksPayload {
                 ack_of_acks_seq_num: 0xFFFF,
             }),
