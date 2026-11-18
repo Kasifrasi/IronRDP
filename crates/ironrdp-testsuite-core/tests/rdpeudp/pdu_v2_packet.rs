@@ -235,14 +235,10 @@ fn v2_flags_auto_computed_on_encode() {
     assert!(!decoded.header.flags.contains(V2Flags::ACKVEC));
 }
 
-/// The v2 header has no standalone flags, so a bit the caller sets without the
-/// payload it announces does not survive the round trip.
-///
-/// Every flag [MS-RDPEUDP2] 2.2.1.1 defines announces a payload. There is
-/// nothing like the v1 header's CN, CWR or SYNLOSSY, which stand on their own
-/// and have to be carried across.
+/// Every flag defined by MS-RDPEUDP2 section 2.2.1.1 announces a payload.
+/// The encoder derives those flags from the payloads present in the packet.
 #[test]
-fn v2_has_no_standalone_flags() {
+fn v2_clears_payload_flags_without_their_payload() {
     let packet = V2Packet {
         header: V2Header {
             // ACKVEC announces a payload this packet does not carry.

@@ -402,11 +402,9 @@ impl V2Packet {
 
     /// Compute flags from populated fields.
     ///
-    /// Every flag [MS-RDPEUDP2] 2.2.1.1 defines announces a payload, so there
-    /// is nothing to carry over from the caller's header: what is present
-    /// determines the field completely.
+    /// Derive payload flags from the fields and carry the optional Windows NOACK flag.
     fn compute_flags(&self) -> V2Flags {
-        let mut flags = V2Flags::empty();
+        let mut flags = self.header.flags & V2Flags::NOACK;
 
         if self.ack.is_some() {
             flags |= V2Flags::ACK;

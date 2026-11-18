@@ -33,15 +33,12 @@ bitflags! {
 
         /// DelayAckInfo payload (Section 2.2.1.2.3) is present.
         const DELAYACKINFO = 0x100;
+
+        /// Windows sets this on data packets without an ACK or ACKVEC payload.
+        const NOACK = 0x200;
     }
 }
 
-// This is the whole table. [MS-RDPEUDP2] 2.2.1.1 defines six flags and no
-// others, so a bit outside this set is one no peer will read and none of them
-// carries a meaning beyond "this payload is present".
-//
-// Two absences are deliberate, because both were once defined here:
-//
 // - There is no DUMMY flag. A dummy packet is marked by Packet_Type_Index 8
 //   in the PacketPrefixByte, one layer down (3.1.1.1.5, `crate::pdu::prefix`).
 // - There are no CN or CWR flags. Those belong to MS-RDPEUDP, whose
