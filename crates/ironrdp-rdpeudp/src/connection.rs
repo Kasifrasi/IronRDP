@@ -1731,7 +1731,10 @@ impl RdpeudpConnection {
         let data_seq = seq::reconstruct_seq(dh.data_seq_num, reference_data);
 
         let reference_channel = recv_window.next_channel_seq();
-        let channel_seq = seq::reconstruct_seq(db.channel_seq_num, reference_channel);
+        let Some(channel_seq) = seq::reconstruct_channel_seq(db.channel_seq_num, reference_channel) else {
+            trace!(data_seq, "Ignored data packet with zero channel sequence");
+            return;
+        };
 
         // Record the packet in the receive window
         let is_new = recv_window.receive(data_seq, channel_seq, db.data.clone());
@@ -2026,7 +2029,7 @@ impl RdpeudpConnection {
             }),
             ack_vector,
             data_body: Some(DataBody {
-                channel_seq_num: seq::truncate_seq(channel_seq),
+                channel_seq_num: seq::truncate_channel_seq(channel_seq),
                 data,
             }),
         };

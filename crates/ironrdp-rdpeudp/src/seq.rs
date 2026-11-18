@@ -51,6 +51,30 @@ pub fn truncate_seq(full: u64) -> u16 {
     u16::try_from(full & 0xFFFF).expect("masked to 16 bits fits in u16")
 }
 
+/// Windows numbers RDP-UDP2 channel data from 1 through 65535 and then restarts at 1.
+/// The send and receive windows count channel chunks consecutively, so use a cycle of 65535 on the wire.
+const CHANNEL_SEQ_CYCLE: u64 = 65_535;
+
+pub(crate) fn truncate_channel_seq(sequence: u64) -> u16 {
+    let wire = (sequence - 1) % CHANNEL_SEQ_CYCLE + 1;
+    u16::try_from(wire).expect("channel sequence fits in u16")
+}
+
+pub(crate) fn reconstruct_channel_seq(wire: u16, reference: u64) -> Option<u64> {
+    if wire == 0 {
+        return None;
+    }
+
+    let reference_wire = u64::from(truncate_channel_seq(reference));
+    let forward = (u64::from(wire) + CHANNEL_SEQ_CYCLE - reference_wire) % CHANNEL_SEQ_CYCLE;
+    let backward = CHANNEL_SEQ_CYCLE - forward;
+    Some(if backward < forward && backward < reference {
+        reference - backward
+    } else {
+        reference + forward
+    })
+}
+
 /// Reconstruct a full 64-bit timestamp (in 4μs units) from a 24-bit wire value
 /// and a nearby reference timestamp.
 ///

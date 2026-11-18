@@ -360,6 +360,32 @@ fn handshake_seeds_rtt_estimate() {
     assert_eq!(server.srtt(), Some(Duration::from_millis(100)));
 }
 
+// oracle: reference FreeRDP/FreeRDP@5a10d7b6b79a:libfreerdp/core/rdpudp.c, channel_seq_next
+#[test]
+fn version_three_channel_sequence_wraps_to_one() {
+    let (mut client, mut server, t) = establish_pair();
+    let payload = [0x9a];
+
+    for expected_channel_seq in (1..=u16::MAX).chain([1]) {
+        server.send(payload.to_vec()).expect("queue server data");
+        let data = server.poll_transmit(t).expect("send data");
+        let mut wire = data.contents.clone();
+        let (_, packet_bytes) = decode_with_prefix(&mut wire).expect("RDP-UDP2 prefix");
+        let packet: V2Packet = decode(packet_bytes).expect("RDP-UDP2 data");
+        assert_eq!(
+            packet.data_body.expect("data body").channel_seq_num,
+            expected_channel_seq
+        );
+
+        let mut wire = data.contents;
+        client.handle_datagram(&mut wire, t).expect("receive data");
+        assert_eq!(client.poll_event(), Some(Event::DataReceived(payload.to_vec())));
+
+        let mut ack = client.poll_transmit(t).expect("ACK").contents;
+        server.handle_datagram(&mut ack, t).expect("receive ACK");
+    }
+}
+
 /// Karn's algorithm (RFC 6298 Section 3): once the client's SYN has been
 /// retransmitted, a SYN+ACK that arrives afterward cannot be tied to a single
 /// transmission, so it must not seed an RTT sample.
