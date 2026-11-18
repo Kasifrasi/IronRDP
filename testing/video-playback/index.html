@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>IronRDP video playback test</title>
+<style>
+  body { margin: 0; background: #111; color: white; font: 26px system-ui; }
+  video { display: block; width: 100vw; height: calc(100vh - 50px); }
+  output { padding: 0 12px; }
+</style>
+<video muted loop playsinline preload="auto" src="probe.mp4"></video>
+<output>Waiting to start</output>
+<script>
+const video = document.querySelector('video');
+const status = document.querySelector('output');
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const cycleCount = 75;
+
+function mark(phase, cycle) {
+  const frames = video.getVideoPlaybackQuality().totalVideoFrames;
+  status.textContent = `${phase} ${cycle} | ${frames} video frames`;
+  void fetch(`/mark/${cycle}/${phase}/${frames}`, { cache: 'no-store' }).catch(console.error);
+}
+
+async function run() {
+  const wait = Number(new URLSearchParams(location.search).get('wait'));
+  await sleep(Number.isFinite(wait) ? Math.max(0, wait) : 0);
+  for (let cycle = 1; cycle <= cycleCount; cycle++) {
+    try {
+      await video.play();
+    } catch {
+      mark('play-error', cycle);
+      return;
+    }
+    if (cycle % 5 === 0) {
+      video.currentTime = 1;
+    }
+    mark('play', cycle);
+    await sleep(cycle % 5 === 0 ? 3400 : 1150);
+    video.pause();
+    mark('pause', cycle);
+    await sleep(cycle % 3 === 0 ? 450 : 230);
+  }
+  mark('done', cycleCount);
+}
+
+void run();
+</script>
+</html>
