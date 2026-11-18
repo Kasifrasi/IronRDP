@@ -112,6 +112,8 @@ Audio plays on the system default output device, followed when it changes; `--au
 `--audio-latency <MS>` sets how much audio is buffered ahead of the speakers (100 ms by default); raise it on networks with high jitter.
 
 The graphics pipeline (MS-RDPEGFX) is used by default with H.264, including AVC444, and MS-RDPEVOR video optimized remoting is accepted; both decode with the Windows H.264 decoder.
+The viewer asks the server to prefer AVC444 when its H.264 decoder supports it.
+The server chooses the codec for each update.
 Build with `--features openh264` to use the bundled OpenH264 sources instead (required on other platforms), and pass `--egfx=false` to keep graphics on the legacy bitmap path.
 For a bounded local graphics recording and playback in FreeRDP, see [Graphics recording and visible replay](../ironrdp-client/README.md#graphics-recording-and-visible-replay).
 

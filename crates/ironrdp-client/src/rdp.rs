@@ -2571,9 +2571,14 @@ fn build_connector(
     // and is awaited when the graphics channel opens, so a slow start does not delay
     // connecting.
     struct EgfxHandler {
+        prefer_avc444: bool,
         capture: Option<crate::graphics_capture::Recorder>,
     }
     impl GraphicsPipelineHandler for EgfxHandler {
+        fn capabilities(&self) -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
+            ironrdp_egfx::client::default_capabilities(self.prefer_avc444)
+        }
+
         fn on_message_received(&mut self, message: &[u8]) {
             if let Some(capture) = &mut self.capture
                 && let Err(error) = capture.record(message)
@@ -2606,6 +2611,7 @@ fn build_connector(
         .with_dynamic_channel({
             let mut egfx = GraphicsPipelineClient::new(
                 Box::new(EgfxHandler {
+                    prefer_avc444: config.prefer_avc444,
                     capture: crate::graphics_capture::Recorder::from_env(),
                 }),
                 h264_decoder,

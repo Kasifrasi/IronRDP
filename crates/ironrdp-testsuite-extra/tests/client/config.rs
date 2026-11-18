@@ -1203,6 +1203,52 @@ impl ironrdp_egfx::decode::H264Decoder for YuvDecoder {
     }
 }
 
+// oracle: spec MS-RDPEGFX §§2.2.3.6–2.2.3.10 define 0x40 as the AVC444 preference, incompatible with AVC_DISABLED (0x20).
+#[test]
+fn viewer_prefers_avc444_on_the_graphics_channel() {
+    use ironrdp_core::{decode, encode_vec};
+    use ironrdp_dvc::DrdynvcClient;
+    use ironrdp_dvc::pdu::{CreateRequestPdu, DrdynvcClientPdu, DrdynvcDataPdu, DrdynvcServerPdu};
+    use ironrdp_egfx::pdu::{CapabilityVersion, GfxPdu};
+    use ironrdp_svc::SvcProcessor as _;
+
+    let config = parse_viewer_config_from_rdp(RDP_TARGET, &[])
+        .into_config_builder()
+        .unwrap()
+        .with_h264_decoder(Some(H264DecoderFactory::new(|| Some(Box::new(YuvDecoder)))))
+        .build()
+        .unwrap();
+    let mut connector = ironrdp_client::__test_build_connector(&config, None).unwrap();
+    let channels = connector.get_static_channel_processor_mut::<DrdynvcClient>().unwrap();
+    let create = DrdynvcServerPdu::Create(CreateRequestPdu::new(1, ironrdp_egfx::CHANNEL_NAME.to_owned()));
+    let responses = channels.process(&encode_vec(&create).unwrap()).unwrap();
+    let caps = responses
+        .iter()
+        .find_map(|response| {
+            let bytes = response.encode_unframed_pdu().unwrap();
+            let DrdynvcClientPdu::Data(DrdynvcDataPdu::Data(data)) = decode(&bytes).unwrap() else {
+                return None;
+            };
+            let GfxPdu::CapabilitiesAdvertise(caps) = decode(data.data()).unwrap() else {
+                return None;
+            };
+            Some(caps.0)
+        })
+        .expect("graphics capability advertisement");
+
+    for version in [
+        CapabilityVersion::V10_3,
+        CapabilityVersion::V10_4,
+        CapabilityVersion::V10_5,
+        CapabilityVersion::V10_6,
+        CapabilityVersion::V10_7,
+    ] {
+        let cap = caps.iter().find(|cap| cap.version == version).unwrap();
+        let flags = u32::from_le_bytes(cap.data[..4].try_into().unwrap());
+        assert_eq!(flags & 0x60, 0x40, "{version:?}");
+    }
+}
+
 fn avc420_update(surface_id: u16) -> ironrdp_egfx::pdu::GfxPdu {
     use ironrdp_egfx::pdu::{
         Avc420Region, Codec1Type, GfxPdu, PixelFormat, WireToSurface1Pdu, encode_avc420_bitmap_stream,

@@ -129,6 +129,7 @@ pub struct Config {
     pub(crate) fake_events_interval: Option<Duration>,
     pub(crate) tcp_connect_attempt_timeout: Option<Duration>,
     pub(crate) channels: ChannelConfig,
+    pub(crate) prefer_avc444: bool,
     pub(crate) administrative_session: bool,
     pub(crate) load_balance_info: Option<String>,
     /// Whether a server redirection connects to the target by name rather than by address.
@@ -1038,6 +1039,7 @@ pub struct ConfigBuilder {
     #[cfg(feature = "udp")]
     udp_offer_version: Option<UdpVersion>,
     graphics_pipeline: Option<bool>,
+    prefer_avc444: bool,
     #[cfg(feature = "vmconnect")]
     vm_id: Option<String>,
     #[cfg(feature = "vmconnect")]
@@ -1690,6 +1692,13 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_graphics_pipeline(mut self, enabled: bool) -> Self {
         self.graphics_pipeline = Some(enabled);
+        self
+    }
+
+    /// Ask the server to prefer AVC444 when the decoder supports it.
+    #[must_use]
+    pub fn with_avc444_preference(mut self, enabled: bool) -> Self {
+        self.prefer_avc444 = enabled;
         self
     }
 
@@ -2846,6 +2855,7 @@ impl ConfigBuilder {
             fake_events_interval: self.fake_events_interval,
             tcp_connect_attempt_timeout: self.tcp_connect_attempt_timeout,
             channels: self.channels,
+            prefer_avc444: self.prefer_avc444,
             administrative_session: self.administrative_session,
             load_balance_info: self.load_balance_info,
             use_redirection_server_name: self.use_redirection_server_name,

@@ -877,6 +877,7 @@ impl ViewerConfig {
         let builder = ConfigBuilder::new()
             .with_connection_type(ironrdp::pdu::gcc::ConnectionType::Autodetect)
             .with_udp_transport(true)
+            .with_avc444_preference(true)
             .with_property_set(&properties)?;
 
         // Whether the `.rdp` file requested clipboard redirection; the CLI `--clipboard-type` is

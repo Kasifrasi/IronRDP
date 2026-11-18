@@ -252,6 +252,41 @@ pub struct BitmapUpdate {
 // Handler Trait
 // ============================================================================
 
+/// Returns the standard graphics capability sets before filtering by decoder support.
+/// With `prefer_avc444`, versions 10.3 through 10.7 advertise the YUV444 preference defined by
+/// [MS-RDPEGFX §2.2.3.6, "RDPGFX_CAPSET_VERSION103"][caps103].
+///
+/// [caps103]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/a73e87d5-10c3-4d3f-b00c-fd5579570a0b
+pub fn default_capabilities(prefer_avc444: bool) -> Vec<CapabilitySet> {
+    let mut flags103 = CapabilitiesV103Flags::empty();
+    let mut flags104 = CapabilitiesV104Flags::SMALL_CACHE;
+    let mut flags107 = CapabilitiesV107Flags::SMALL_CACHE;
+    flags103.set(CapabilitiesV103Flags::AVC_THIN_CLIENT, prefer_avc444);
+    flags104.set(CapabilitiesV104Flags::AVC_THIN_CLIENT, prefer_avc444);
+    flags107.set(CapabilitiesV107Flags::AVC_THIN_CLIENT, prefer_avc444);
+
+    vec![
+        CapabilitySet::V10_7 { flags: flags107 },
+        CapabilitySet::V10_6 { flags: flags104 },
+        CapabilitySet::V10_5 { flags: flags104 },
+        CapabilitySet::V10_4 { flags: flags104 },
+        CapabilitySet::V10_3 { flags: flags103 },
+        CapabilitySet::V10_2 {
+            flags: CapabilitiesV10Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V10_1,
+        CapabilitySet::V10 {
+            flags: CapabilitiesV10Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::SMALL_CACHE,
+        },
+    ]
+}
+
 /// Handler trait for client-side EGFX events
 ///
 /// Implement this trait to receive decoded bitmap data and surface
@@ -278,36 +313,7 @@ pub trait GraphicsPipelineHandler: Send {
     ///
     /// [capability negotiation]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/31c6e2b1-335b-4a75-9454-bb2309958c21
     fn capabilities(&self) -> Vec<CapabilitySet> {
-        vec![
-            CapabilitySet::V10_7 {
-                flags: CapabilitiesV107Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V10_6 {
-                flags: CapabilitiesV104Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V10_5 {
-                flags: CapabilitiesV104Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V10_4 {
-                flags: CapabilitiesV104Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V10_3 {
-                flags: CapabilitiesV103Flags::empty(),
-            },
-            CapabilitySet::V10_2 {
-                flags: CapabilitiesV10Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V10_1,
-            CapabilitySet::V10 {
-                flags: CapabilitiesV10Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V8_1 {
-                flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V8 {
-                flags: CapabilitiesV8Flags::SMALL_CACHE,
-            },
-        ]
+        default_capabilities(false)
     }
 
     /// Called when the server confirms negotiated capabilities
