@@ -200,6 +200,14 @@ const PIGGYBACK_RESERVE: usize = 134 + 2;
 /// link that is losing packets.
 const HANDSHAKE_RETRANSMIT_LIMIT: u8 = 5;
 
+fn windows_cookie_hash(mut hash: [u8; 32]) -> [u8; 32] {
+    // Windows reads each SHA-256 word in little-endian order despite the network byte order in MS-RDPEUDP 2.2.2.9.
+    for word in hash.chunks_exact_mut(4) {
+        word.reverse();
+    }
+    hash
+}
+
 /// How many multiples of the send window's own capacity `send()` lets the
 /// send buffer hold ahead of it before returning `SendBufferFull`.
 ///
@@ -572,7 +580,8 @@ impl RdpeudpConnection {
                 .cookie_hash
                 .ok_or_else(|| RdpeudpError::invalid_packet("accept", "version 3 SYN carries no cookieHash"))?;
 
-            if offered_hash != expected_hash {
+            // Accept the Windows encoding and the digest in network byte order specified by MS-RDPEUDP.
+            if offered_hash != windows_cookie_hash(expected_hash) && offered_hash != expected_hash {
                 negotiated_version = UdpVersion::V2;
             }
         }
@@ -1104,7 +1113,7 @@ impl RdpeudpConnection {
                 // 2.2.2.9: mandatory with version 3 in a client SYN.
                 // `connect` refuses to build a connection without it.
                 cookie_hash: if self.config.offer_version == UdpVersion::V3 {
-                    self.config.cookie_hash
+                    self.config.cookie_hash.map(windows_cookie_hash)
                 } else {
                     None
                 },
